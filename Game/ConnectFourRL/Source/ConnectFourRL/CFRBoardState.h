@@ -6,7 +6,7 @@
 #include "CFRBoardState.generated.h"
 
 /**
- * Represents which player occupies a cell, or whether it is empty.
+ * @brief Represents which player occupies a cell, or whether it is empty.
  */
 UENUM(BlueprintType)
 enum class ECFRCell : uint8
@@ -17,9 +17,10 @@ enum class ECFRCell : uint8
 };
 
 /**
- * Represents the current game mode.
- * 2D: classic 6x7 Connect Four (SizeZ is always 1).
- * 3D: 4x4x4 Connect Four.
+ * @brief Represents the current game mode.
+ *
+ * @note Mode2D uses a 6x7x1 board (classic Connect Four).
+ *       Mode3D uses a 4x4x4 board.
  */
 UENUM(BlueprintType)
 enum class ECFRGameMode : uint8
@@ -29,10 +30,10 @@ enum class ECFRGameMode : uint8
 };
 
 /**
- * FCFRBoardState
+ * @brief Stores the complete state of the game board in a flat array.
  *
- * Stores the complete state of the game board in a flat array.
- * Supports both 2D and 3D modes using the same data structure.
+ * Supports both 2D and 3D modes using the same data structure and index formula.
+ * Replicated as a whole by ACFRGameState — this struct itself has no network logic.
  *
  * Coordinate system:
  *   X = column  (left  -> right)
@@ -41,44 +42,53 @@ enum class ECFRGameMode : uint8
  *
  * Cell index formula: X + (Y * SizeX) + (Z * SizeX * SizeY)
  *
- * 2D default: SizeX=7, SizeY=6, SizeZ=1
- * 3D default: SizeX=4, SizeY=4, SizeZ=4
+ * Default dimensions:
+ *   2D: SizeX=7, SizeY=6, SizeZ=1
+ *   3D: SizeX=4, SizeY=4, SizeZ=4
  */
 USTRUCT(BlueprintType)
 struct CONNECTFOURRL_API FCFRBoardState
 {
 	GENERATED_BODY()
 
-	// Board dimensions
+	/** @brief Number of columns (X axis). */
 	UPROPERTY(BlueprintReadOnly)
 	int32 SizeX = 7;
 
+	/** @brief Number of rows (Y axis, gravity direction). */
 	UPROPERTY(BlueprintReadOnly)
 	int32 SizeY = 6;
 
+	/** @brief Depth of the board (Z axis). Always 1 in 2D mode. */
 	UPROPERTY(BlueprintReadOnly)
 	int32 SizeZ = 1;
 
-	// Current game mode (2D or 3D)
+	/** @brief Current game mode (2D or 3D). Set by Init(). */
 	UPROPERTY(BlueprintReadOnly)
 	ECFRGameMode GameMode = ECFRGameMode::Mode2D;
 
-	// Flat array storing every cell's state
-	// Size = SizeX * SizeY * SizeZ
+	/**
+	 * @brief Flat array storing every cell's state.
+	 * @note  Size = SizeX * SizeY * SizeZ.
+	 */
 	UPROPERTY(BlueprintReadOnly)
 	TArray<ECFRCell> Cells;
 
-	// Which player's turn it is (1 or 2)
+	/** @brief Index of the player whose turn it is (1 or 2). */
 	UPROPERTY(BlueprintReadOnly)
 	int32 CurrentPlayer = 1;
 
-	// Total number of moves made so far
+	/** @brief Total number of moves made so far in this game. */
 	UPROPERTY(BlueprintReadOnly)
 	int32 MoveCount = 0;
 
 	/**
-	 * Initializes the board for the given game mode.
-	 * Clears all cells and resets turn to Player 1.
+	 * @brief Initializes the board for the given game mode.
+	 *
+	 * Sets board dimensions, clears all cells to Empty,
+	 * and resets CurrentPlayer to 1 and MoveCount to 0.
+	 *
+	 * @param Mode  The game mode to initialize (Mode2D or Mode3D).
 	 */
 	void Init(ECFRGameMode Mode)
 	{
@@ -103,8 +113,12 @@ struct CONNECTFOURRL_API FCFRBoardState
 	}
 
 	/**
-	 * Returns the cell state at position (X, Y, Z).
-	 * Returns Empty if coordinates are out of bounds.
+	 * @brief Returns the cell state at position (X, Y, Z).
+	 *
+	 * @param X  Column index (0 to SizeX-1).
+	 * @param Y  Row index    (0 to SizeY-1).
+	 * @param Z  Depth index  (0 to SizeZ-1), always 0 in 2D mode.
+	 * @return   The cell state, or ECFRCell::Empty if out of bounds.
 	 */
 	ECFRCell GetCell(int32 X, int32 Y, int32 Z) const
 	{
@@ -113,8 +127,14 @@ struct CONNECTFOURRL_API FCFRBoardState
 	}
 
 	/**
-	 * Sets the cell state at position (X, Y, Z).
-	 * Does nothing if coordinates are out of bounds.
+	 * @brief Sets the cell state at position (X, Y, Z).
+	 *
+	 * Does nothing if the coordinates are out of bounds.
+	 *
+	 * @param X      Column index (0 to SizeX-1).
+	 * @param Y      Row index    (0 to SizeY-1).
+	 * @param Z      Depth index  (0 to SizeZ-1), always 0 in 2D mode.
+	 * @param Value  The cell state to write.
 	 */
 	void SetCell(int32 X, int32 Y, int32 Z, ECFRCell Value)
 	{
@@ -123,7 +143,12 @@ struct CONNECTFOURRL_API FCFRBoardState
 	}
 
 	/**
-	 * Returns true if (X, Y, Z) is within the board boundaries.
+	 * @brief Returns true if (X, Y, Z) is within the board boundaries.
+	 *
+	 * @param X  Column index to check.
+	 * @param Y  Row index to check.
+	 * @param Z  Depth index to check.
+	 * @return   True if all three indices are within [0, Size-1].
 	 */
 	bool IsInBounds(int32 X, int32 Y, int32 Z) const
 	{
@@ -133,9 +158,14 @@ struct CONNECTFOURRL_API FCFRBoardState
 	}
 
 	/**
-	 * Returns the lowest empty row (Y) in the column defined by (X, Z).
-	 * Returns -1 if the column is full.
-	 * This is the gravity / drop mechanic shared by both 2D and 3D modes.
+	 * @brief Returns the lowest empty row (Y) in the column defined by (X, Z).
+	 *
+	 * Implements the gravity / drop mechanic shared by both 2D and 3D modes.
+	 * In 2D mode, always pass Z = 0.
+	 *
+	 * @param X  Column index.
+	 * @param Z  Depth index (0 in 2D mode).
+	 * @return   The lowest empty Y index, or -1 if the column is full.
 	 */
 	int32 GetDropRow(int32 X, int32 Z) const
 	{
