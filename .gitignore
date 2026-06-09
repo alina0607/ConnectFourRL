@@ -1,0 +1,40 @@
+# ============================================================
+# UE5
+# ============================================================
+Game/Binaries/
+Game/Build/
+Game/DerivedDataCache/
+Game/Intermediate/
+Game/Saved/
+Game/.vs/
+Game/*.sln
+Game/*.suo
+Game/Plugins/*/Binaries/
+Game/Plugins/*/Intermediate/
+
+# ============================================================
+# Python / AI
+# ============================================================
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 訓練好的模型檔（檔案太大，用其他方式管理）
+AI/models/checkpoints/*.pt
+AI/models/checkpoints/*.pth
+AI/models/exported/*.pt
+AI/models/exported/*.onnx
+
+# 對局資料（累積後會很大）
+AI/data/games/*.json
+AI/data/processed/*.npy
+AI/data/processed/*.npz
+
+# ============================================================
+# 系統
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
