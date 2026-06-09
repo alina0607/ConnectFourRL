@@ -1,16 +1,17 @@
 # ============================================================
 # UE5
 # ============================================================
-Game/Binaries/
-Game/Build/
-Game/DerivedDataCache/
-Game/Intermediate/
-Game/Saved/
-Game/.vs/
-Game/*.sln
-Game/*.suo
-Game/Plugins/*/Binaries/
-Game/Plugins/*/Intermediate/
+Game/ConnectFourRL/Binaries/
+Game/ConnectFourRL/Build/
+Game/ConnectFourRL/DerivedDataCache/
+Game/ConnectFourRL/Intermediate/
+Game/ConnectFourRL/Saved/
+Game/ConnectFourRL/.vs/
+Game/ConnectFourRL/*.sln
+Game/ConnectFourRL/*.suo
+Game/ConnectFourRL/.vsconfig
+Game/ConnectFourRL/Plugins/*/Binaries/
+Game/ConnectFourRL/Plugins/*/Intermediate/
 
 # ============================================================
 # Python / AI
