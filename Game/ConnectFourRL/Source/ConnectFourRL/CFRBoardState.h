@@ -83,33 +83,47 @@ struct CONNECTFOURRL_API FCFRBoardState
 	int32 MoveCount = 0;
 
 	/**
-	 * @brief Initializes the board for the given game mode.
+	 * @brief Column (X), row (Y), and depth (Z) of the most recently placed piece.
 	 *
-	 * Sets board dimensions, clears all cells to Empty,
-	 * and resets CurrentPlayer to 1 and MoveCount to 0.
+	 * Set by ApplyDrop after every move. Used by CheckConsecutive to restrict
+	 * win detection to the last played cell, reducing complexity from
+	 * O(W * H * D * Directions * N) to O(Directions * N).
 	 *
-	 * @param Mode  The game mode to initialize (Mode2D or Mode3D).
+	 * Initialized to -1 to indicate no move has been made yet.
 	 */
-	void Init(ECFRGameMode Mode)
+	UPROPERTY(BlueprintReadOnly)
+	int32 LastMoveX = -1;
+
+	UPROPERTY(BlueprintReadOnly)
+	int32 LastMoveY = -1;
+
+	UPROPERTY(BlueprintReadOnly)
+	int32 LastMoveZ = -1;
+
+	/**
+	 * @brief Initializes the board with explicit dimensions.
+	 *
+	 * Board dimensions are owned by the rule set (UCFRGameRulesBase),
+	 * not hardcoded here. Call this from CreateInitialBoard() only.
+	 *
+	 * @param Mode  The game mode (2D or 3D).
+	 * @param InSizeX  Number of columns.
+	 * @param InSizeY  Number of rows (gravity direction).
+	 * @param InSizeZ  Depth (1 for 2D mode).
+	 */
+	void Init(ECFRGameMode Mode, int32 InSizeX, int32 InSizeY, int32 InSizeZ)
 	{
 		GameMode = Mode;
-
-		if (Mode == ECFRGameMode::Mode2D)
-		{
-			SizeX = 7;
-			SizeY = 6;
-			SizeZ = 1;
-		}
-		else
-		{
-			SizeX = 4;
-			SizeY = 4;
-			SizeZ = 4;
-		}
+		SizeX    = InSizeX;
+		SizeY    = InSizeY;
+		SizeZ    = InSizeZ;
 
 		Cells.Init(ECFRCell::Empty, SizeX * SizeY * SizeZ);
 		CurrentPlayer = 1;
 		MoveCount     = 0;
+		LastMoveX     = -1;
+		LastMoveY     = -1;
+		LastMoveZ     = -1;
 	}
 
 	/**

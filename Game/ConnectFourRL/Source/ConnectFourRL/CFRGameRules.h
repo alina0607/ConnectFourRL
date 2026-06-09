@@ -126,4 +126,4 @@ public:
      * @return        True if that player has won.
      */
     virtual bool HasPlayerWon(const FCFRBoardState& Board, int32 Player) const = 0;
-};
+}; 

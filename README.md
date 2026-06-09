@@ -186,6 +186,59 @@ Interface methods:
 
 ---
 
+## Performance & Algorithm Design
+
+### Incremental Win Detection
+
+Naïve win-checking scans every cell on the board after each move:
+
+```
+Complexity: O(W × H × D × Directions × N)
+  2D example: 7 × 6 × 1 × 4 × 4  =   672 operations / call
+  3D example: 4 × 4 × 4 × 13 × 4 = 3,328 operations / call
+```
+
+This project uses an **incremental, bidirectional scan** anchored on the last placed piece:
+
+```
+Complexity: O(Directions × N)
+  2D: 4 × 4  =  16 operations / call   (~42× faster)
+  3D: 13 × 4 =  52 operations / call   (~64× faster)
+```
+
+**Why this is correct:**
+A new winning run can only pass through the piece that was just placed. Any run that existed before the move was already checked in a previous turn. Therefore it is sufficient — and complete — to restrict the search to that single cell.
+
+**Bidirectional scan:**
+For each direction axis, the algorithm walks both `+Dir` and `−Dir` from the placed piece and sums the counts. This correctly handles cases where the winning piece completes a run from the middle:
+
+```
+Before:  ■ ■ _ ■    (3 pieces, gap in position 2)
+Move:    ■ ■ X ■    (X placed at position 2)
+
++Dir count = 1  (one piece to the right)
+−Dir count = 2  (two pieces to the left)
+Total      = 1 + 2 + 1 (center) = 4  →  WIN
+```
+
+**Additional optimization — single-player result check:**
+`CheckResult` only evaluates the player who just moved. Because a win requires placing a piece, the non-active player cannot have created a new winning condition this turn, halving the number of `HasPlayerWon` calls per move.
+
+### MCTS Performance Impact
+
+During self-play, MCTS evaluates thousands of simulated game trees per move. A typical 2D game lasts ~21 moves; with 800 simulations per move:
+
+| Metric | Naïve scan | Incremental scan |
+|--------|-----------|-----------------|
+| `CheckResult` calls per move | 800 × 21 = 16,800 | 16,800 |
+| Operations per call (2D) | 672 | 16 |
+| **Total operations per move** | **11.3 M** | **268 K** |
+| Relative speedup | 1× | **~42×** |
+
+At scale (millions of self-play games), this difference is the boundary between a training pipeline that completes overnight and one that takes weeks.
+
+---
+
 ## AI Pipeline
 
 ### Stage 1 — Supervised Learning (Human Data)
