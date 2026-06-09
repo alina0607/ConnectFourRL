@@ -104,6 +104,88 @@ ConnectFourRL/
 
 ---
 
+## Core Data & Rules Design
+
+### FCFRBoardState
+
+The board is stored as a **flat 1D array** regardless of mode, using an index formula to map 3D coordinates:
+
+```
+index = X + (Y * SizeX) + (Z * SizeX * SizeY)
+
+Coordinate system:
+  X = column  (left → right)
+  Y = row     (bottom → top, gravity direction)
+  Z = depth   (front → back, always 0 in 2D mode)
+
+2D board: SizeX=7, SizeY=6, SizeZ=1
+3D board: SizeX=4, SizeY=4, SizeZ=4
+```
+
+Why a flat array?
+- Native UE5 `TArray` replication support (required for networking)
+- Contiguous memory = better cache performance
+- Simple serialization to JSON for AI training data
+
+Key methods:
+
+| Method | Description |
+|--------|-------------|
+| `Init(Mode)` | Sets board dimensions, clears all cells, resets turn to Player 1 |
+| `GetCell(X, Y, Z)` | Reads a cell state; returns Empty if out of bounds |
+| `SetCell(X, Y, Z, Value)` | Writes a cell state; no-op if out of bounds |
+| `IsInBounds(X, Y, Z)` | Validates that all three indices are within board limits |
+| `GetDropRow(X, Z)` | Gravity mechanic — returns the lowest empty Y in column (X, Z), or -1 if full |
+
+### ICFRGameRules
+
+A pure C++ interface that defines the complete rule contract for Connect Four.
+Both 2D and 3D implementations must satisfy every method.
+
+**Why an interface?**
+Swapping between 2D and 3D only requires pointing to a different implementation — no other system changes.
+
+**Move execution flow:**
+
+```
+Player selects (X, Z)
+        ↓
+IsLegalDrop(Board, X, Z)      — is this move allowed?
+        ↓ legal
+ApplyDrop(Board, X, Z, Out)   — execute move, return NEW board (original untouched)
+        ↓
+CheckResult(OutBoard)         — did the game end?
+        ↓
+HasPlayerWon()                — called internally by CheckResult
+```
+
+**Why ApplyDrop returns a new board instead of modifying in place?**
+MCTS simulates thousands of branches from the same position simultaneously.
+Each branch needs its own independent copy — mutating the original would corrupt all other branches.
+
+**Why GetLegalMoves matters for MCTS:**
+
+```
+2D — scans X=0..6, Z=0:    up to 7 legal positions   e.g. [(0,0),(1,0),(3,0)...]
+3D — scans all (X,Z) pairs: up to 16 legal positions  e.g. [(0,0),(0,1),(1,0)...]
+```
+
+MCTS calls `GetLegalMoves` at every node to know which branches to expand next.
+
+Interface methods:
+
+| Method | Description |
+|--------|-------------|
+| `GetGameMode()` | Returns Mode2D or Mode3D — identifies which rule set is active |
+| `CreateInitialBoard()` | Builds and returns a fresh empty board for this mode |
+| `IsLegalDrop(Board, X, Z)` | True if (X,Z) is in bounds and the column is not full |
+| `GetLegalMoves(Board)` | Returns all legal (X,Z) positions as `TArray<FIntPoint>` |
+| `ApplyDrop(Board, X, Z, Out)` | Copies board, places piece, advances turn — original board unchanged |
+| `CheckResult(Board)` | Returns Ongoing / Player1Wins / Player2Wins / Draw |
+| `HasPlayerWon(Board, Player)` | Checks all directions for four consecutive pieces |
+
+---
+
 ## AI Pipeline
 
 ### Stage 1 — Supervised Learning (Human Data)
