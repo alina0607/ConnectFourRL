@@ -64,9 +64,15 @@ ConnectFourRL/
 │   └── Source/
 │       └── ConnectFourRL/
 │           ├── Core/            # Board state, rules interface (2D & 3D)
+│           │   ├── CFRBoardState.h
+│           │   ├── ICFRGameRules.h
+│           │   ├── CFRGameRules2D.h/.cpp
+│           │   └── CFRGameMode.h/.cpp
 │           ├── Network/         # Multiplayer replication
+│           │   └── CFRGameState.h/.cpp
 │           ├── UI/              # HUD, widgets
 │           └── Data/            # Game recording & JSON export
+│               └── CFRGameRecorder.h/.cpp
 │
 └── AI/                          # Python Deep Learning
     ├── data/
@@ -80,6 +86,21 @@ ConnectFourRL/
     ├── training/                # Training scripts
     └── selfplay/                # Self-play data generation
 ```
+
+---
+
+## C++ Class Responsibilities
+
+| Class | Type | Responsibility |
+|-------|------|----------------|
+| `FCFRBoardState` | Struct | Holds the raw board data — who placed a piece where |
+| `ICFRGameRules` | Interface | Shared rule contract for both 2D and 3D modes |
+| `UCFRGameRules2D` | UObject | Implements 2D win detection, legal moves, apply move |
+| `ACFRGameMode` | AGameMode | Controls turn flow, calls rules, detects game over |
+| `ACFRGameState` | AGameState | Replicates board state to all clients over network |
+| `UCFRGameRecorder` | UObject | Records every move, exports finished game as JSON |
+
+> Adding 3D support later only requires a new `UCFRGameRules3D` class — nothing else changes.
 
 ---
 
