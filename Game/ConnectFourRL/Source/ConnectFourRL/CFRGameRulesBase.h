@@ -91,6 +91,35 @@ public:
 	 */
 	virtual ECFRGameResult CheckResult(const FCFRBoardState& Board) const override;
 
+	/**
+	 * @brief Returns true if cell (X, Y, Z) is in bounds and currently empty.
+	 *
+	 * Used for 2D free-placement mode where the player picks any vacant cell
+	 * directly (no gravity / column mechanic).
+	 *
+	 * @param Board  Current board state.
+	 * @param X      Column index (0 to SizeX-1).
+	 * @param Y      Row index    (0 to SizeY-1).
+	 * @param Z      Depth index  (0 to SizeZ-1); always 0 in 2D mode.
+	 */
+	bool IsLegalPlace(const FCFRBoardState& Board, int32 X, int32 Y, int32 Z) const;
+
+	/**
+	 * @brief Places the current player's piece directly at cell (X, Y, Z),
+	 *        bypassing the gravity mechanic.
+	 *
+	 * Used in 2D free-placement mode. Rejects the move if the target cell is
+	 * occupied or out of bounds.
+	 *
+	 * @param Board     Input board (not modified).
+	 * @param X         Column index.
+	 * @param Y         Row index.
+	 * @param Z         Depth index; always 0 in 2D mode.
+	 * @param OutBoard  Output board after the move.
+	 * @return          True if the piece was placed; false if illegal.
+	 */
+	bool ApplyPlace(const FCFRBoardState& Board, int32 X, int32 Y, int32 Z, FCFRBoardState& OutBoard) const;
+
 protected:
 
 	/**

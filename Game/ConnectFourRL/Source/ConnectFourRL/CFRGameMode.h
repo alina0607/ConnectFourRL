@@ -8,7 +8,8 @@
 #include "CFRGameRules.h"
 #include "CFRGameMode.generated.h"
 
-class UCFRGameRules2D;
+class UCFRGameRulesBase;
+class ACFRPiece;
 
 /**
  * @brief Game mode that owns the rule set and live board state for a Connect Four session.
@@ -16,8 +17,9 @@ class UCFRGameRules2D;
  * Responsibilities:
  *   - Creates and holds the UCFRGameRules2D instance at BeginPlay.
  *   - Processes player move requests via TryDrop().
- *   - Converts board coordinates to Unreal world positions for visual piece placement.
- *   - Fires Blueprint events when a piece is placed or the game ends.
+ *   - Spawns game piece actors at the correct world position after each move.
+ *   - Converts board coordinates to Unreal world positions.
+ *   - Fires a Blueprint event when the game ends.
  */
 UCLASS()
 class CONNECTFOURRL_API ACFRGameMode : public AGameModeBase
@@ -32,9 +34,9 @@ public:
 	// Game state
 	// ------------------------------------------------------------------
 
-	/** @brief The active rule set. Created at BeginPlay via NewObject. */
+	/** @brief The active rule set. Swapped between UCFRGameRules2D and UCFRGameRules3D on mode toggle. */
 	UPROPERTY(BlueprintReadOnly, Category = "Rules")
-	TObjectPtr<UCFRGameRules2D> Rules;
+	TObjectPtr<UCFRGameRulesBase> Rules;
 
 	/** @brief The live board state updated after every accepted move. */
 	UPROPERTY(BlueprintReadOnly, Category = "Game")
@@ -44,13 +46,84 @@ public:
 	// Visual configuration
 	// ------------------------------------------------------------------
 
-	/** @brief Distance between cell centres in Unreal world units. */
+	/** @brief Distance between cell centres in the horizontal plane (World X / Y), in world units. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Board|Visual")
-	float CellSize = 100.f;
+	float CellSize = 150.f;
+
+	/**
+	 * @brief Vertical distance between stacked piece centres in 3D mode, in world units.
+	 *
+	 * Decoupled from CellSize so the stacking step can be tuned to match the
+	 * actual donut mesh height without affecting the horizontal grid spacing.
+	 * Also controls the Z half-extent of the 3D debug-grid box so the overlay
+	 * visually matches the piece proportions.
+	 *
+	 * Has no effect in 2D mode (all pieces land flat at World Z = 0).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Board|Visual", meta = (ClampMin = "1.0"))
+	float CellHeight = 50.f;
+
+	/** @brief When true, draws the board grid with debug lines every frame during PIE. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Board|Debug")
+	bool bDrawDebugGrid = false;
+
+	/**
+	 * @brief Visual gap between adjacent debug-grid cell boxes, in world units.
+	 * Increase to create visible spacing; 0 = cells are edge-to-edge.
+	 * Exposed so designers can tune appearance without recompiling.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Board|Debug", meta = (ClampMin = "0.0"))
+	float CellGap = 10.f;
+
+	// ------------------------------------------------------------------
+	// Hover state — updated every frame by ACFRPlayerController
+	// ------------------------------------------------------------------
+
+	/** @brief Column index (X) currently under the mouse cursor (-1 = none). */
+	UPROPERTY(BlueprintReadOnly, Category = "Game")
+	int32 HoveredColumn = -1;
+
+	/**
+	 * @brief Row index (Y) currently under the mouse cursor.
+	 * Meaningful only in 2D free-placement mode where the player picks individual cells.
+	 * Always 0 in 3D mode (gravity determines the row after drop).
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Game")
+	int32 HoveredRow = 0;
+
+	/** @brief Depth index (Z) currently under the mouse cursor (always 0 in 2D). */
+	UPROPERTY(BlueprintReadOnly, Category = "Game")
+	int32 HoveredDepth = 0;
+
+	/**
+	 * @brief Called every frame by ACFRPlayerController with the board cell under the cursor.
+	 * Updates the hover highlight in the debug grid.
+	 *
+	 * @param Col    Board column index (X), or -1 if outside the board.
+	 * @param Row    Board row index (Y); used for individual cell highlight in 2D mode.
+	 * @param Depth  Board depth index (Z); always 0 in 2D mode.
+	 */
+	void SetHoveredCell(int32 Col, int32 Row, int32 Depth);
 
 	/** @brief World-space position of board cell (0, 0, 0). Set this in the level. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Board|Visual")
 	FVector BoardOrigin = FVector::ZeroVector;
+
+	/** @brief Piece class to spawn for Player 1. Set to BP_CFRPiece_P1 in the editor. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Piece")
+	TSubclassOf<ACFRPiece> PieceActorClassP1;
+
+	/** @brief Piece class to spawn for Player 2. Set to BP_CFRPiece_P2 in the editor. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Piece")
+	TSubclassOf<ACFRPiece> PieceActorClassP2;
+
+	/** @brief Height above the target cell where the piece spawns before falling (World Z offset). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Piece")
+	float DropStartHeight = 800.f;
+
+	/** @brief Fall speed in Unreal units per second. Higher = faster drop. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Piece")
+	float PieceFallSpeed = 600.f;
 
 	// ------------------------------------------------------------------
 	// Game logic — called by ACFRColumnActor on player click
@@ -59,8 +132,8 @@ public:
 	/**
 	 * @brief Attempts to drop the current player's piece in column (X, Z).
 	 *
-	 * Validates the move, updates CurrentBoard, fires OnPiecePlaced,
-	 * and fires OnGameEnded if the game has reached a terminal state.
+	 * Uses the gravity mechanic: the piece falls to the lowest empty row in the
+	 * chosen column.  Intended for 3D mode (and any gravity-based variant).
 	 *
 	 * @param X  Column index (0 to SizeX-1).
 	 * @param Z  Depth index; always 0 in 2D mode.
@@ -70,35 +143,52 @@ public:
 	bool TryDrop(int32 X, int32 Z = 0);
 
 	/**
+	 * @brief Places the current player's piece directly at cell (X, Y, Z).
+	 *
+	 * No gravity — the piece lands at the exact row specified.
+	 * Used in 2D free-placement mode where the player picks any vacant cell.
+	 *
+	 * @param X  Column index (0 to SizeX-1).
+	 * @param Y  Row index    (0 to SizeY-1).
+	 * @param Z  Depth index; always 0 in 2D mode.
+	 * @return   True if the move was accepted and applied.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Game")
+	bool TryPlace(int32 X, int32 Y, int32 Z = 0);
+
+	/**
+	 * @brief Toggles between 2D and 3D mode.
+	 * Destroys all spawned pieces, resets the board, and reinitialises the rule set.
+	 * Intended for debug / testing only.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Game|Debug")
+	void SwitchGameMode();
+
+	/**
 	 * @brief Returns the Unreal world position of board cell (X, Y, Z).
 	 *
-	 * Coordinate mapping:
-	 *   Board X (column) → World Y  (left / right)
-	 *   Board Y (row)    → World Z  (up / down)
-	 *   Board Z (depth)  → World X  (always 0 in 2D mode)
+	 * The mapping is mode-dependent:
+	 *
+	 *   2D (SizeZ == 1):
+	 *     Board X (col, 0-6) → World X  (left / right)
+	 *     Board Y (row, 0-5) → World Y  (front / back; gravity fills Y=0 first)
+	 *     Board Z = 0        → World Z  = 0  (all cells lie flat on the ground)
+	 *
+	 *   3D (SizeZ == 4):
+	 *     Board X (col,   0-3) → World X  (left / right)
+	 *     Board Z (depth, 0-3) → World Y  (front / back)
+	 *     Board Y (row,   0-3) → World Z  (up; pieces stack upward)
 	 *
 	 * @param X  Board column index.
 	 * @param Y  Board row index (gravity direction).
-	 * @param Z  Board depth index.
+	 * @param Z  Board depth index (always 0 in 2D mode).
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Board|Visual")
 	FVector GetCellWorldPosition(int32 X, int32 Y, int32 Z) const;
 
 	// ------------------------------------------------------------------
-	// Blueprint events — implement visuals in BP_CFRGameMode
+	// Blueprint event — implement result UI in BP_CFRGameMode
 	// ------------------------------------------------------------------
-
-	/**
-	 * @brief Fired after a piece is successfully placed.
-	 * Blueprint should spawn the donut mesh at GetCellWorldPosition(X, Y, Z).
-	 *
-	 * @param X       Column index of the placed piece.
-	 * @param Y       Row index (the gravity-resolved drop row).
-	 * @param Z       Depth index (always 0 in 2D).
-	 * @param Player  The player who placed the piece (1 or 2).
-	 */
-	UFUNCTION(BlueprintImplementableEvent, Category = "Game")
-	void OnPiecePlaced(int32 X, int32 Y, int32 Z, int32 Player);
 
 	/**
 	 * @brief Fired when the game reaches a terminal state.
@@ -112,4 +202,10 @@ public:
 protected:
 
 	virtual void BeginPlay() override;
+	virtual void Tick(float DeltaSeconds) override;
+
+private:
+
+	/** @brief Draws a box at every cell centre to visualise grid layout during PIE. */
+	void DrawDebugGrid() const;
 };

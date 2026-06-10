@@ -14,10 +14,12 @@ Internal document for contributors. Covers project structure, class responsibili
 6. [Rules System Design](#rules-system-design)
 7. [Win Detection Algorithm](#win-detection-algorithm)
 8. [Move Execution Flow](#move-execution-flow)
-9. [Networking Plan](#networking-plan)
-10. [Code Conventions](#code-conventions)
-11. [How to Add 3D Mode](#how-to-add-3d-mode)
-12. [Branch & Commit Convention](#branch--commit-convention)
+9. [Player Input System](#player-input-system)
+10. [Piece Spawning & Animation](#piece-spawning--animation)
+11. [Debug Grid System](#debug-grid-system)
+12. [Networking Plan](#networking-plan)
+13. [Code Conventions](#code-conventions)
+14. [Branch & Commit Convention](#branch--commit-convention)
 
 ---
 
@@ -53,12 +55,17 @@ ConnectFourRL/
 │
 ├── Game/ConnectFourRL/
 │   └── Source/ConnectFourRL/          # ALL C++ files live here (flat — no subfolders)
-│       ├── CFRBoardState.h            # USTRUCT — board data
+│       ├── CFRBoardState.h            # USTRUCT — board data and cell index logic
 │       ├── CFRGameRules.h/.cpp        # UINTERFACE — rule contract
 │       ├── CFRGameRulesBase.h/.cpp    # Abstract UObject — shared logic
-│       ├── CFRGameRules2D.h/.cpp      # Concrete 2D rule set
+│       ├── CFRGameRules2D.h/.cpp      # Concrete 2D rule set (4 directions)
+│       ├── CFRGameRules3D.h/.cpp      # Concrete 3D rule set (13 directions)
 │       ├── CFRGameMode.h/.cpp         # AGameModeBase — session controller
-│       └── CFRColumnActor.h/.cpp      # AActor — column click detection
+│       ├── CFRPlayerController.h/.cpp # APlayerController — mouse input via ray trace
+│       ├── CFRPiece.h/.cpp            # AActor — falling piece with animation
+│       ├── CFRGameState.h/.cpp        # AGameStateBase — shell for networking
+│       ├── CFRGameRecorder.h/.cpp     # UObject — shell for AI data recording
+│       └── CFRColumnActor.h/.cpp      # AActor — superseded by PlayerController ray trace
 │
 └── AI/                                # Python pipeline (not yet implemented)
     ├── data/games/                    # Raw JSON game records
@@ -98,28 +105,33 @@ If you selected the wrong parent:
 ## Class Reference
 
 ### FCFRBoardState
-**File:** `CFRBoardState.h`  
+**File:** `CFRBoardState.h`
 **Type:** `USTRUCT(BlueprintType)`
 
 Complete snapshot of the board at any moment. Designed for **value semantics** — copying is safe and cheap enough for MCTS branching.
 
 ```
 Fields:
-  int32 SizeX, SizeY, SizeZ          Board dimensions (set by Rules, not hardcoded)
-  ECFRGameMode GameMode               Mode2D or Mode3D
-  TArray<ECFRCell> Cells              Flat 1D cell array
-  int32 CurrentPlayer                 1 or 2
-  int32 MoveCount                     Total moves this game
-  int32 LastMoveX, LastMoveY, LastMoveZ   Position of last placed piece (-1 if none)
+  int32 SizeX, SizeY, SizeZ            Board dimensions (set by Rules, not hardcoded)
+  ECFRGameMode GameMode                 Mode2D or Mode3D
+  TArray<ECFRCell> Cells                Flat 1D cell array
+  int32 CurrentPlayer                   1 or 2
+  int32 MoveCount                       Total moves this game
+  int32 LastMoveX, LastMoveY, LastMoveZ Position of last placed piece (-1 if none)
 ```
 
 ```
 Key methods:
-  Init(Mode, SizeX, SizeY, SizeZ)    Reset board — called by CreateInitialBoard() only
-  GetCell(X, Y, Z)                   Safe read — returns Empty if out of bounds
-  SetCell(X, Y, Z, Value)            Safe write — no-op if out of bounds
-  IsInBounds(X, Y, Z)                Bounds check for all three axes
-  GetDropRow(X, Z)                   Gravity — lowest empty Y in column, or -1 if full
+  Init(Mode, SizeX, SizeY, SizeZ)      Reset board — called by CreateInitialBoard() only
+  GetCell(X, Y, Z)                     Safe read — returns Empty if out of bounds
+  SetCell(X, Y, Z, Value)              Safe write — no-op if out of bounds
+  IsInBounds(X, Y, Z)                  Bounds check for all three axes
+  GetDropRow(X, Z)                     Gravity — lowest empty Y in column, or -1 if full
+```
+
+Cell index formula:
+```
+index = X + (Y * SizeX) + (Z * SizeX * SizeY)
 ```
 
 The out-of-bounds safety in `GetCell` / `SetCell` is intentional — it allows the win-detection
@@ -128,47 +140,49 @@ scanner to walk past board edges without explicit boundary checks in the loop.
 ---
 
 ### ICFRGameRules
-**File:** `CFRGameRules.h`  
+**File:** `CFRGameRules.h`
 **Type:** `UINTERFACE`
 
 Pure interface. No logic lives here — only method signatures.
 Any system that needs to call game rules holds an `ICFRGameRules*` pointer,
-never a concrete type. This makes rule-set swapping transparent.
+never a concrete type.
 
 ```
 Pure virtual methods:
-  GetGameMode()                      Returns Mode2D or Mode3D
-  CreateInitialBoard()               Fresh board, dimensions from the rule set
-  IsLegalDrop(Board, X, Z)           In-bounds + column not full
-  GetLegalMoves(Board)               All legal (X,Z) pairs as TArray<FIntPoint>
-  ApplyDrop(Board, X, Z, OutBoard)   Copy board, drop piece, advance turn — original unchanged
-  CheckResult(Board)                 Ongoing / Player1Wins / Player2Wins / Draw
-  HasPlayerWon(Board, Player)        Checks all directions for a run of 4
+  GetGameMode()                        Returns Mode2D or Mode3D
+  CreateInitialBoard()                 Fresh board, dimensions from the rule set
+  IsLegalDrop(Board, X, Z)            In-bounds + column not full (3D gravity)
+  GetLegalMoves(Board)                 All legal (X,Z) pairs as TArray<FIntPoint>
+  ApplyDrop(Board, X, Z, OutBoard)    Copy board, gravity drop, advance turn
+  CheckResult(Board)                   Ongoing / Player1Wins / Player2Wins / Draw
+  HasPlayerWon(Board, Player)          Checks all directions for a run of 4
 ```
 
 ---
 
 ### UCFRGameRulesBase
-**File:** `CFRGameRulesBase.h / .cpp`  
+**File:** `CFRGameRulesBase.h / .cpp`
 **Type:** `UCLASS(Abstract)` — inherits `UObject`, implements `ICFRGameRules`
 
-Implements every method that is **identical between 2D and 3D**.
+Implements every method that is identical between 2D and 3D.
 Subclasses only override `GetGameMode()` and `HasPlayerWon()`.
 
 ```
-Configurable UPROPERTY fields (set in Editor or Blueprint):
-  int32 BoardSizeX = 7
-  int32 BoardSizeY = 6
-  int32 BoardSizeZ = 1
+Configurable UPROPERTY fields:
+  int32 BoardSizeX = 7    (overridden to 4 in UCFRGameRules3D)
+  int32 BoardSizeY = 6    (overridden to 4 in UCFRGameRules3D)
+  int32 BoardSizeZ = 1    (overridden to 4 in UCFRGameRules3D)
 ```
 
 ```
 Shared implementations:
-  CreateInitialBoard()    Calls Board.Init() with the configured dimensions
-  IsLegalDrop()          IsInBounds check + GetDropRow != -1
-  GetLegalMoves()        Scans all (X,Z), collects legal positions
-  ApplyDrop()            Deep copy, gravity, record LastMove, advance turn
-  CheckResult()          Only checks the last mover for win; then checks draw
+  CreateInitialBoard()      Calls Board.Init() with the configured dimensions
+  IsLegalDrop(X, Z)        IsInBounds + GetDropRow != -1 (gravity-based)
+  IsLegalPlace(X, Y, Z)    IsInBounds + cell is empty (free placement, 2D)
+  GetLegalMoves()           Scans all (X,Z), collects legal drop positions
+  ApplyDrop(X, Z)           Deep copy, gravity, record LastMove, advance turn
+  ApplyPlace(X, Y, Z)       Deep copy, direct placement, record LastMove, advance turn
+  CheckResult()             Only checks last mover for win, then checks draw
 ```
 
 ```
@@ -176,16 +190,15 @@ Protected static helper:
   CheckConsecutive(Board, Player, Directions, ConnectN)
     — Bidirectional scan from Board.LastMove in each direction
     — Subclasses pass their direction array; loop body written once here
-    — See Win Detection Algorithm section for details
 ```
 
 ---
 
 ### UCFRGameRules2D
-**File:** `CFRGameRules2D.h / .cpp`  
+**File:** `CFRGameRules2D.h / .cpp`
 **Type:** `UCLASS` — inherits `UCFRGameRulesBase`
 
-Only two overrides needed:
+Board size: 7 × 6 × 1. Player freely places a piece on any empty cell.
 
 ```cpp
 ECFRGameMode GetGameMode() const override { return ECFRGameMode::Mode2D; }
@@ -193,93 +206,229 @@ ECFRGameMode GetGameMode() const override { return ECFRGameMode::Mode2D; }
 bool HasPlayerWon(const FCFRBoardState& Board, int32 Player) const override
 {
     static const FIntVector Directions[] = {
-        { 1,  0, 0 },  // horizontal
-        { 0,  1, 0 },  // vertical
-        { 1,  1, 0 },  // diagonal up-right
-        { 1, -1, 0 },  // diagonal down-right
+        { 1,  0, 0 },  // horizontal  (X axis)
+        { 0,  1, 0 },  // vertical    (Y axis)
+        { 1,  1, 0 },  // diagonal ↗
+        { 1, -1, 0 },  // diagonal ↘
     };
     return CheckConsecutive(Board, Player, Directions);
 }
 ```
 
-Everything else is inherited from `UCFRGameRulesBase` unchanged.
+---
+
+### UCFRGameRules3D
+**File:** `CFRGameRules3D.h / .cpp`
+**Type:** `UCLASS` — inherits `UCFRGameRulesBase`
+
+Board size: 4 × 4 × 4. Player selects a (X, Z) column; gravity places at lowest empty Y.
+
+```cpp
+UCFRGameRules3D::UCFRGameRules3D()
+{
+    BoardSizeX = 4;
+    BoardSizeY = 4;
+    BoardSizeZ = 4;
+}
+```
+
+13 win directions cover every possible axis in a 3D grid:
+
+| Group | Directions |
+|-------|-----------|
+| Face-to-face axes (3) | +X, +Y, +Z |
+| Face diagonals — XY plane (2) | (1,1,0), (1,-1,0) |
+| Face diagonals — XZ plane (2) | (1,0,1), (1,0,-1) |
+| Face diagonals — YZ plane (2) | (0,1,1), (0,1,-1) |
+| Space diagonals (4) | (1,1,1), (1,1,-1), (1,-1,1), (1,-1,-1) |
 
 ---
 
 ### ACFRGameMode
-**File:** `CFRGameMode.h / .cpp`  
+**File:** `CFRGameMode.h / .cpp`
 **Type:** `UCLASS` — inherits `AGameModeBase`
 
-Server-authoritative session controller. In a networked game, this class only exists on the server.
+Server-authoritative session controller.
+Owns the active rule set and the live board state.
+Spawns piece actors directly in C++ (no Blueprint event delegation).
 
 ```
-Fields:
-  UCFRGameRules2D* Rules         Created via NewObject at BeginPlay
-  FCFRBoardState CurrentBoard    Updated after every accepted move
-  float CellSize = 100.f         World-unit size of one cell (configurable)
-  FVector BoardOrigin            World position of cell (0,0,0) (configurable)
+Key UPROPERTY fields:
+  UCFRGameRulesBase* Rules              Active rule set (2D or 3D)
+  FCFRBoardState CurrentBoard           Live board updated after every move
+
+  float CellSize       = 150.f          Horizontal cell spacing in world units (X/Y)
+  float CellHeight     = 50.f           Vertical stacking step in 3D mode (World Z)
+  float CellGap        = 10.f           Visual gap between debug grid boxes
+  FVector BoardOrigin  = (0,0,0)        World position of board cell (0,0,0)
+
+  TSubclassOf<ACFRPiece> PieceActorClassP1   Set to BP_CFRPiece_P1 in editor
+  TSubclassOf<ACFRPiece> PieceActorClassP2   Set to BP_CFRPiece_P2 in editor
+  float DropStartHeight = 800.f         Spawn height above ground (World Z offset)
+  float PieceFallSpeed  = 600.f         Fall speed in units/second
+
+  bool bDrawDebugGrid = false            Enable debug cell overlay in PIE
+
+  int32 HoveredColumn = -1              Cell under cursor (X), -1 = none
+  int32 HoveredRow    = 0               Cell under cursor (Y), 2D only
+  int32 HoveredDepth  = 0               Cell under cursor (Z), 3D only
+```
+
+```
+Key methods:
+  BeginPlay()                Creates Rules (2D by default) + initial board
+  TryDrop(X, Z)              3D: gravity drop into column (X,Z); spawns ACFRPiece
+  TryPlace(X, Y, Z)          2D: direct placement at cell (X,Y,0); spawns ACFRPiece
+  SwitchGameMode()           Destroys all pieces, toggles 2D↔3D, resets board
+  GetCellWorldPosition(X,Y,Z) Board coords → world space (mode-aware, see below)
+  SetHoveredCell(Col,Row,Depth) Called every frame by PlayerController
+  DrawDebugGrid()            Internal — draws cell overlay when bDrawDebugGrid = true
+
+Blueprint events (implement in BP_CFRGameMode):
+  OnGameEnded(Result)        Show win/draw UI
+```
+
+---
+
+### ACFRPlayerController
+**File:** `CFRPlayerController.h / .cpp`
+**Type:** `UCLASS` — inherits `APlayerController`
+
+Handles all local player input. Uses **ray-plane intersection** so column detection
+is accurate at any camera angle without requiring hit-box actors.
+
+```
+Setup:
+  bShowMouseCursor  = true
+  bEnableClickEvents = true
+```
+
+```
+Per-frame Tick:
+  1. TraceToBoard()        — ray-plane intersection → hovered cell
+  2. Left click detected   → OnClickBoard()
+  3. Space bar detected    → GameMode->SwitchGameMode()
+```
+
+**TraceToBoard — plane selection:**
+
+| Mode | Intersection Plane | Extracts |
+|------|-------------------|---------|
+| 2D | Z = BoardOrigin.Z (flat ground) | Col (X), Row (Y) |
+| 3D | Z = BoardOrigin.Z (flat ground) | Col (X), Depth (Y→BoardZ) |
+
+Both modes intersect the horizontal ground plane because both boards have
+their bottom face at World Z = BoardOrigin.Z.
+
+**OnClickBoard:**
+
+| Mode | Action |
+|------|--------|
+| 2D | `GameMode->TryPlace(HoveredColumn, HoveredRow, 0)` |
+| 3D | `GameMode->TryDrop(HoveredColumn, HoveredDepth)` |
+
+---
+
+### ACFRPiece
+**File:** `CFRPiece.h / .cpp`
+**Type:** `UCLASS` — inherits `AActor`
+
+Visually represents one placed piece. Falls from spawn height to target position.
+
+```
+Components:
+  USceneComponent* SceneRoot       Root — isolates mesh pivot from spawn position
+  UStaticMeshComponent* Mesh       Child — mesh and material set in Blueprint
 ```
 
 ```
 Methods:
-  BeginPlay()                    Creates Rules + initial board
-  TryDrop(X, Z)                  Validates, applies move, fires events
-  GetCellWorldPosition(X, Y, Z)  Board coords → Unreal world space
-
-Blueprint events (implement in BP_CFRGameMode):
-  OnPiecePlaced(X, Y, Z, Player) Spawn mesh at GetCellWorldPosition(X, Y, Z)
-  OnGameEnded(Result)            Show win/draw UI
+  StartFall(TargetLocation, FallSpeed)   Enables Tick, begins descent
+  Tick(DeltaTime)                        VInterpConstantTo toward target; disables when arrived
 ```
 
-**World coordinate mapping:**
-
+Blueprint hierarchy:
 ```
-Board X (column) → World Y  (left / right)
-Board Y (row)    → World Z  (up / down, gravity)
-Board Z (depth)  → World X  (always 0 in 2D)
+ACFRPiece (C++)
+  └── BP_CFRPiece          (parent Blueprint — base settings)
+        ├── BP_CFRPiece_P1 (child — donut mesh A + material for Player 1)
+        └── BP_CFRPiece_P2 (child — donut mesh B + material for Player 2)
 ```
 
-**Important:** Capture `CurrentPlayer` before calling `ApplyDrop` — the turn advances inside that call.
+Donut pivot offsets are corrected by adjusting the `Mesh` relative transform
+inside each Blueprint child — no C++ changes needed.
 
 ---
 
-### ACFRColumnActor
-**File:** `CFRColumnActor.h / .cpp`  
-**Type:** `UCLASS` — inherits `AActor`
+### ACFRGameState
+**File:** `CFRGameState.h / .cpp`
+**Type:** `UCLASS` — inherits `AGameStateBase`
 
-Invisible tall box placed above each column in the level.
-On click → casts to `ACFRGameMode` → calls `TryDrop(ColumnIndex, DepthIndex)`.
+Shell class reserved for the networking phase.
+Will hold a replicated `FCFRBoardState` when multiplayer is implemented.
 
-```
-Fields:
-  int32 ColumnIndex = 0    Board X index — set per instance in Editor
-  int32 DepthIndex  = 0    Board Z index — always 0 in 2D
-  UBoxComponent* HitBox    Root component, captures mouse clicks
-```
+---
 
-In 2D mode: place 7 instances with `ColumnIndex = 0..6`.
-Box extent defaults to `(40, 40, 300)` — covers full column height.
+### UCFRGameRecorder
+**File:** `CFRGameRecorder.h / .cpp`
+**Type:** `UCLASS` — inherits `UObject`
 
-Click detection requires the Player Controller to have `bEnableClickEvents = true`.
-Set this in the Game Mode Blueprint or in a custom PlayerController class.
+Shell class reserved for AI data collection.
+Will serialize game records to JSON for Deep Learning training.
 
 ---
 
 ## Board Coordinate System
 
+Board axes are shared by both modes:
 ```
-index = X + (Y * SizeX) + (Z * SizeX * SizeY)
-
-  X — column  (0 = left,   SizeX-1 = right)
-  Y — row     (0 = bottom, SizeY-1 = top)     ← gravity fills from 0 upward
-  Z — depth   (0 = front,  SizeZ-1 = back)    ← always 0 in 2D mode
-
-2D default:  SizeX=7  SizeY=6  SizeZ=1   →  42 cells
-3D default:  SizeX=4  SizeY=4  SizeZ=4   →  64 cells
+X — column  (0 = left,   SizeX-1 = right)
+Y — row     (0 = bottom, SizeY-1 = top)     ← gravity fills from 0 upward
+Z — depth   (0 = front,  SizeZ-1 = back)    ← always 0 in 2D mode
 ```
 
-GetCell returns `ECFRCell::Empty` for any out-of-bounds coordinate.
-This is load-bearing — the win scanner relies on it to terminate naturally at board edges.
+**`GetCellWorldPosition(X, Y, Z)` is mode-aware:**
+
+### 2D Mode (SizeZ == 1)
+
+The board is a flat horizontal slab on the ground (World XY plane).
+No vertical stacking — all pieces land at World Z = 0.
+
+```
+Board X (col, 0-6) → World X  (left / right)
+Board Y (row, 0-5) → World Y  (front / back; gravity fills Y=0 first)
+Board Z = 0        → World Z  = 0  (flat on ground)
+
+Formula: BoardOrigin + FVector(X * CellSize, Y * CellSize, 0)
+```
+
+Piece animation: spawns at `(X*CellSize, Y*CellSize, BoardOrigin.Z + DropStartHeight)`
+and falls straight down to `World Z = 0`.
+
+### 3D Mode (SizeZ == 4)
+
+The 4×4 base grid is flat on the ground; pieces stack upward along World Z.
+
+```
+Board X (col,   0-3) → World X  (left / right)
+Board Z (depth, 0-3) → World Y  (front / back)
+Board Y (row,   0-3) → World Z  (up; stacking, uses CellHeight not CellSize)
+
+Formula: BoardOrigin + FVector(X * CellSize, Z * CellSize, Y * CellHeight)
+```
+
+`CellHeight` is **decoupled from `CellSize`** so the vertical stacking step
+can be tuned to match the actual mesh height without affecting the horizontal grid.
+
+Piece animation: spawns at `(X*CellSize, Z*CellSize, BoardOrigin.Z + DropStartHeight)`
+and falls straight down to `World Z = Y * CellHeight`.
+
+### Board Defaults
+
+```
+2D: SizeX=7  SizeY=6  SizeZ=1   →  42 cells
+3D: SizeX=4  SizeY=4  SizeZ=4   →  64 cells
+```
 
 ---
 
@@ -289,29 +438,30 @@ This is load-bearing — the win scanner relies on it to terminate naturally at 
 ICFRGameRules              (interface — pure contract)
         │
 UCFRGameRulesBase          (abstract — shared logic)
-        ├── UCFRGameRules2D    (4 directions)
-        └── UCFRGameRules3D    (13 directions — future)
+        ├── UCFRGameRules2D    (4 directions, free placement)
+        └── UCFRGameRules3D    (13 directions, gravity drop)
 ```
 
 **Why interface + abstract base, not just a base class?**
 
-- Any system holds `ICFRGameRules*` — never a concrete type
+- Any system holds `UCFRGameRulesBase*` — never a concrete type
 - Runtime mode switching = swap the pointer, nothing else changes
 - `UCFRGameRulesBase` removes all code duplication between modes
-- Adding a new mode requires only one new class
+- Adding a new variant requires only one new subclass
 
-**Why ApplyDrop returns a new board instead of mutating?**
+**2D vs 3D placement mechanics:**
 
-MCTS explores thousands of branches simultaneously from the same root state:
+| | 2D | 3D |
+|---|---|---|
+| Player input | Click any empty (X, Y) cell | Click (X, Z) column base |
+| Gravity | None — piece placed at exact (X, Y, 0) | Piece falls to lowest empty Y in (X, Z) |
+| Legal check | `IsLegalPlace(X, Y, Z)` — cell empty? | `IsLegalDrop(X, Z)` — column not full? |
+| Apply method | `ApplyPlace(X, Y, Z, OutBoard)` | `ApplyDrop(X, Z, OutBoard)` |
 
-```
-Root ─┬─ column 0 ─ column 0 ─ ...
-      ├─ column 1 ─ column 3 ─ ...
-      └─ column 4 ─ column 1 ─ ...
-```
+**Why ApplyDrop / ApplyPlace return a new board instead of mutating?**
 
-If ApplyDrop mutated the board in place, branches would corrupt each other.
-Returning `OutBoard` keeps every branch fully independent.
+MCTS explores thousands of branches simultaneously from the same root state.
+Returning `OutBoard` keeps every branch fully independent without copies.
 
 ---
 
@@ -331,13 +481,16 @@ Returning `OutBoard` keeps every branch fully independent.
 3. return false
 ```
 
+Complexity: **O(D × N)** where D = number of directions, N = ConnectN (4).
+Naive full-board scan would be O(W × H × D × N × Z).
+
 ### Why Bidirectional
 
 Walking only `+Dir` misses wins completed from the middle:
 
 ```
 Board:  ■ ■ _ ■    Player drops at position 2:    ■ ■ X ■
-+Dir only: sees 1 piece to the right → Count = 2 → miss
++Dir only: sees 1 piece to the right → Count = 2 → MISS
 Bidirectional: 2 left + 1 right + 1 center = 4 → WIN ✓
 ```
 
@@ -345,54 +498,172 @@ Bidirectional: 2 left + 1 right + 1 center = 4 → WIN ✓
 
 A win requires placing a piece. The player who did not just move placed nothing new this turn,
 so they cannot have formed a new winning run. `CheckResult` identifies the last mover as
-`3 - CurrentPlayer` (since `ApplyDrop` already advanced the turn) and checks only them.
+`3 - CurrentPlayer` (since `ApplyDrop` / `ApplyPlace` already advanced the turn)
+and checks only them.
 
 ---
 
 ## Move Execution Flow
 
-### Local (current)
+### 2D Free Placement
 
 ```
-ACFRColumnActor::OnHitBoxClicked
-    └─ ACFRGameMode::TryDrop(ColumnIndex, 0)
-           ├─ Rules->IsLegalDrop()           reject if illegal
-           ├─ Rules->ApplyDrop()             deep copy, gravity, LastMove, advance turn
-           ├─ CurrentBoard = NextBoard
-           ├─ OnPiecePlaced(X, Y, Z, Player) BP event → spawn mesh
-           ├─ Rules->CheckResult()
-           └─ OnGameEnded(Result)            BP event (only if terminal)
+ACFRPlayerController::Tick
+  └─ TraceToBoard()                      Z-plane intersection → (Col, Row)
+       └─ GameMode->SetHoveredCell()     update hover highlight
+
+Left click detected:
+  └─ OnClickBoard()
+       └─ GameMode->TryPlace(Col, Row, 0)
+              ├─ Rules->ApplyPlace()     IsLegalPlace check, deep copy, advance turn
+              ├─ CurrentBoard = NextBoard
+              ├─ GetCellWorldPosition(X, Y, 0)  → flat ground position
+              ├─ SpawnActor<ACFRPiece>   spawn above, StartFall to ground
+              └─ Rules->CheckResult()
+                   └─ OnGameEnded()     BP event (only if terminal)
+```
+
+### 3D Gravity Drop
+
+```
+ACFRPlayerController::Tick
+  └─ TraceToBoard()                      Z-plane intersection → (Col, Depth)
+       └─ GameMode->SetHoveredCell()     update hover highlight
+
+Left click detected:
+  └─ OnClickBoard()
+       └─ GameMode->TryDrop(Col, Depth)
+              ├─ Rules->ApplyDrop()      IsLegalDrop check, gravity, deep copy, advance turn
+              ├─ CurrentBoard = NextBoard
+              ├─ GetCellWorldPosition(X, LastMoveY, Z)  → stacked position
+              ├─ SpawnActor<ACFRPiece>   spawn above, StartFall to stack height
+              └─ Rules->CheckResult()
+                   └─ OnGameEnded()     BP event (only if terminal)
+```
+
+### Mode Switch (Space Bar)
+
+```
+ACFRPlayerController::Tick detects Space Bar
+  └─ GameMode->SwitchGameMode()
+         ├─ GetAllActorsOfClass(ACFRPiece) → Destroy() all pieces
+         ├─ Toggle: NewObject<UCFRGameRules3D> or NewObject<UCFRGameRules2D>
+         └─ CurrentBoard = Rules->CreateInitialBoard()
 ```
 
 ### Networked (planned)
 
 ```
-Client: ACFRColumnActor click
-    └─ Server RPC: TryDrop_Server(X, Z)
-           └─ ACFRGameMode::TryDrop()        server-side only
-                  └─ ACFRGameState::Board updated + marked dirty
-                         └─ Replication → all clients
-                                └─ OnRep_Board() → each client spawns mesh
+Client: PlayerController click
+  └─ Server RPC: TryDrop_Server(X, Z) or TryPlace_Server(X, Y, Z)
+         └─ ACFRGameMode (server only)
+                └─ ACFRGameState::Board updated + marked dirty
+                       └─ Replication → all clients
+                              └─ OnRep_Board() → each client spawns ACFRPiece
 ```
+
+---
+
+## Player Input System
+
+Input is handled entirely through **ray-plane intersection** in `ACFRPlayerController::TraceToBoard`.
+No hit-box actors (ACFRColumnActor) are used for input — the class exists but is superseded.
+
+```
+DeprojectMousePositionToWorld(RayOrigin, RayDirection)
+  └─ Solve: T = (BoardOrigin.Z - RayOrigin.Z) / RayDirection.Z
+       └─ HitPoint = RayOrigin + T * RayDirection
+            ├─ Col   = floor((HitPoint.X - BoardOrigin.X) / CellSize)
+            ├─ Row   = floor((HitPoint.Y - BoardOrigin.Y) / CellSize)  [2D only]
+            └─ Depth = floor((HitPoint.Y - BoardOrigin.Y) / CellSize)  [3D only]
+```
+
+Degenerate cases guarded:
+- `RayDirection.Z ≈ 0` → ray nearly parallel to ground → skip frame
+- `T ≤ 0` → board is behind camera → skip frame
+
+---
+
+## Piece Spawning & Animation
+
+Both `TryDrop` and `TryPlace` follow the same spawn pattern:
+
+```cpp
+// Spawn above the target, always at the same altitude regardless of stack height.
+FVector SpawnLocation = FVector(
+    TargetLocation.X,
+    TargetLocation.Y,
+    BoardOrigin.Z + DropStartHeight   // always the same absolute height
+);
+
+ACFRPiece* Piece = SpawnActor<ACFRPiece>(PieceClass, SpawnLocation, ...);
+Piece->StartFall(TargetLocation, PieceFallSpeed);
+```
+
+`StartFall` enables `Tick`. Each tick:
+```cpp
+CurrentLocation = VInterpConstantTo(CurrentLocation, TargetLocation, DeltaTime, FallSpeed);
+if (FMath::IsNearlyEqual(CurrentLocation.Z, TargetLocation.Z, 0.5f)) { SetActorTickEnabled(false); }
+```
+
+**Important:** `ActivePlayer` must be captured **before** `ApplyDrop` / `ApplyPlace` —
+those calls advance `CurrentPlayer` internally.
+
+---
+
+## Debug Grid System
+
+Enabled by setting `bDrawDebugGrid = true` on `BP_CFRGameMode`.
+Drawn every frame in `ACFRGameMode::Tick` → `DrawDebugGrid()`.
+
+### 2D Debug Grid
+
+- Draws all 7 × 6 = 42 cells as flat slabs in the World XY plane (World Z = 0)
+- Box extent: `(VisualHalf, VisualHalf, SlabHalf)` — thin in Z
+- Hovered cell `(HoveredColumn, HoveredRow)` → green (empty) or red (occupied)
+- All other cells → cyan
+
+### 3D Debug Grid
+
+- Draws only the base layer (Board Y = 0): 4 × 4 = 16 cells
+- Box extent: `(VisualHalf, VisualHalf, CellHeight * 0.5f)` — height matches donut mesh
+- Hovered cell `(HoveredColumn, HoveredDepth)` → green (column has space) or red (full)
+- All other cells → cyan
+
+### Parameters
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `CellSize` | 150 | Horizontal spacing between cell centres (X/Y) |
+| `CellHeight` | 50 | Vertical stacking step in 3D; also debug box Z height |
+| `CellGap` | 10 | Shrinks debug box relative to spacing — makes gap visible |
+
+Visual box size = `CellSize - CellGap`. A gap of 10 on a 150-unit cell = 6.7% gap.
+Set `CellGap` to 20–30 for clearly visible separation.
+
+### DrawDebugString Lifetime
+
+`DrawDebugString` with lifetime `-1.f` is **permanent** (never cleared).
+All calls use `0.f` (single-frame draw) to prevent string accumulation across mode switches.
+`DrawDebugBox` with `-1.f` correctly draws for one frame only — different behaviour.
 
 ---
 
 ## Networking Plan
 
-Classes to add:
+Classes to implement:
 
 | Class | Type | Role |
 |-------|------|------|
-| `ACFRGameState` | `AGameState` | Holds `FCFRBoardState` with `Replicated` tag; replicates board to all clients |
-| `ACFRPlayerController` | `APlayerController` | Issues Server RPCs on player click; handles local input only |
+| `ACFRGameState` | `AGameState` | Holds replicated `FCFRBoardState`; replicates board to all clients |
 
 Changes to existing classes:
 
 | Class | Change |
 |-------|--------|
-| `ACFRColumnActor` | Replace direct `TryDrop` call with `Server RPC` via PlayerController |
-| `ACFRGameMode` | Add authority guard (`HasAuthority()`) to `TryDrop` |
-| Blueprint visual layer | Move mesh spawn from `OnPiecePlaced` event to `OnRep_Board` callback |
+| `ACFRPlayerController` | Replace direct `TryDrop` / `TryPlace` with Server RPCs |
+| `ACFRGameMode` | Add `HasAuthority()` guard to `TryDrop` / `TryPlace` |
+| Blueprint layer | Move piece spawn from game mode to `OnRep_Board` callback on clients |
 
 `FCFRBoardState` requires no changes — `TArray` replicates natively in UE5.
 
@@ -420,59 +691,25 @@ Changes to existing classes:
 ```cpp
 // .h — full Doxygen on declaration
 /**
- * @brief Returns true if dropping at column (X, Z) is legal.
+ * @brief Returns true if cell (X, Y, Z) is in bounds and currently empty.
  * @param Board  Current board state.
  * @param X      Column index.
+ * @param Y      Row index.
  * @param Z      Depth index; always 0 in 2D mode.
  */
-virtual bool IsLegalDrop(const FCFRBoardState& Board, int32 X, int32 Z) const override;
+bool IsLegalPlace(const FCFRBoardState& Board, int32 X, int32 Y, int32 Z) const;
 
 // .cpp — minimal inline comment only where needed
-bool UCFRGameRulesBase::IsLegalDrop(const FCFRBoardState& Board, int32 X, int32 Z) const
+bool UCFRGameRulesBase::IsLegalPlace(const FCFRBoardState& Board, int32 X, int32 Y, int32 Z) const
 {
-    if (!Board.IsInBounds(X, 0, Z)) { return false; }
-    return Board.GetDropRow(X, Z) != -1;  // -1 means column is full
+    return Board.IsInBounds(X, Y, Z) && Board.GetCell(X, Y, Z) == ECFRCell::Empty;
 }
 ```
 
 ### No Hardcoded Values
 
-Board dimensions must never be hardcoded. They are owned by `UCFRGameRulesBase` as
-`UPROPERTY` fields (`BoardSizeX`, `BoardSizeY`, `BoardSizeZ`) and passed to `FCFRBoardState::Init()`.
-
----
-
-## How to Add 3D Mode
-
-1. `Tools → New C++ Class`, parent = `None`, name = `CFRGameRules3D`
-2. Change parent in `.h` to `UCFRGameRulesBase`, add correct include
-3. Implement two methods only:
-
-```cpp
-ECFRGameMode GetGameMode() const override { return ECFRGameMode::Mode3D; }
-
-bool HasPlayerWon(const FCFRBoardState& Board, int32 Player) const override
-{
-    static const FIntVector Directions[] =
-    {
-        // Face-to-face axes
-        { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 },
-        // Face diagonals
-        { 1, 1, 0 }, { 1,-1, 0 },
-        { 1, 0, 1 }, { 1, 0,-1 },
-        { 0, 1, 1 }, { 0, 1,-1 },
-        // Space diagonals
-        { 1, 1, 1 }, { 1, 1,-1 },
-        { 1,-1, 1 }, { 1,-1,-1 },
-    };
-    return CheckConsecutive(Board, Player, Directions);
-}
-```
-
-4. In `ACFRGameMode`, swap `UCFRGameRules2D` for `UCFRGameRules3D` (or expose as a selectable UPROPERTY)
-5. In the level, place 16 `ACFRColumnActor` instances (4×4 grid, ColumnIndex 0–3, DepthIndex 0–3)
-
-No other class changes required.
+Board dimensions, cell spacing, fall speed, etc. must never be hardcoded.
+All tunable values are owned as `UPROPERTY` fields so designers can adjust without recompiling.
 
 ---
 
@@ -499,6 +736,6 @@ type:
 Examples:
 ```
 feat: implement incremental win detection with bidirectional scan
-fix: LastMoveY not recorded when column is full
-docs: add networking plan to ARCHITECTURE.md
+fix: DrawDebugString lifetime accumulation across mode switches
+docs: update ARCHITECTURE.md coordinate system and class reference
 ```

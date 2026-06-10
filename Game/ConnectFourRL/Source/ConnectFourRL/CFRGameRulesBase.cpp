@@ -120,3 +120,34 @@ bool UCFRGameRulesBase::IsLegalDrop(const FCFRBoardState& Board, int32 X, int32 
 	// -1 means the column is full.
 	return Board.GetDropRow(X, Z) != -1;
 }
+
+bool UCFRGameRulesBase::IsLegalPlace(const FCFRBoardState& Board, int32 X, int32 Y, int32 Z) const
+{
+	// The target cell must be inside the board and currently empty.
+	return Board.IsInBounds(X, Y, Z) && Board.GetCell(X, Y, Z) == ECFRCell::Empty;
+}
+
+bool UCFRGameRulesBase::ApplyPlace(
+	const FCFRBoardState& Board,
+	int32 X, int32 Y, int32 Z,
+	FCFRBoardState& OutBoard) const
+{
+	if (!IsLegalPlace(Board, X, Y, Z)) { return false; }
+
+	// Deep-copy so the caller's board is not mutated (required for MCTS branching).
+	OutBoard = Board;
+
+	const ECFRCell Piece = (OutBoard.CurrentPlayer == 1) ? ECFRCell::Player1 : ECFRCell::Player2;
+	OutBoard.SetCell(X, Y, Z, Piece);
+
+	// Record position for O(D*N) win detection in CheckConsecutive.
+	OutBoard.LastMoveX = X;
+	OutBoard.LastMoveY = Y;
+	OutBoard.LastMoveZ = Z;
+
+	// Advance turn: 1 → 2 → 1 → ...
+	OutBoard.CurrentPlayer = (OutBoard.CurrentPlayer == 1) ? 2 : 1;
+	OutBoard.MoveCount++;
+
+	return true;
+}
