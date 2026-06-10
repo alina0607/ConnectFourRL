@@ -1,9 +1,4 @@
-# Classical AI
-
-Author: Ju-ve Chankasemporn  
-E-mail: juvereturn@gmail.com
-
-`CFR` means **Connect Four Reinforcement Learning**.
+# Classical AI Documentation
 
 This folder contains a reusable minimax alpha-beta search and the classes that
 adapt the ConnectFourRL board to it.
