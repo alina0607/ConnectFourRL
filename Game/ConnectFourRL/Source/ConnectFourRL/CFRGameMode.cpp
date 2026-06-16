@@ -2,16 +2,21 @@
 
 #include "CFRGameMode.h"
 #include "CFRGameRules2D.h"
+#include "CFRGameRules2DClassic.h"
 #include "CFRGameRules3D.h"
 #include "CFRGameRulesBase.h"
 #include "CFRPlayerController.h"
 #include "CFRPiece.h"
+#include "CFRGameRecorder.h"
+#include "CFRGameState.h"
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
+#include "Engine/Engine.h"
 
 ACFRGameMode::ACFRGameMode()
 {
 	PlayerControllerClass = ACFRPlayerController::StaticClass();
+	GameStateClass        = ACFRGameState::StaticClass();
 	PrimaryActorTick.bCanEverTick = true;
 }
 
@@ -21,6 +26,46 @@ void ACFRGameMode::BeginPlay()
 
 	Rules        = NewObject<UCFRGameRules2D>(this);
 	CurrentBoard = Rules->CreateInitialBoard();
+	bGameOver    = false;
+
+	// Mirror static visual parameters into the replicated GameState once, then
+	// keep the board in sync after every move.
+	CFRGameState = GetWorld()->GetGameState<ACFRGameState>();
+	if (CFRGameState)
+	{
+		CFRGameState->CellSize    = CellSize;
+		CFRGameState->CellHeight  = CellHeight;
+		CFRGameState->BoardOrigin = BoardOrigin;
+	}
+	SyncStateToGameState();
+
+	if (bRecordGames)
+	{
+		Recorder = NewObject<UCFRGameRecorder>(this);
+		Recorder->StartGame(CurrentBoard);
+	}
+
+	OnGameStarted(ECFRGameMode::Mode2D);
+}
+
+void ACFRGameMode::PostLogin(APlayerController* NewPlayer)
+{
+	Super::PostLogin(NewPlayer);
+
+	// Hand out player numbers in join order: 1, 2, then 3+ (extra = spectators
+	// since the turn check only accepts the current player's number).
+	if (ACFRPlayerController* PC = Cast<ACFRPlayerController>(NewPlayer))
+	{
+		PC->PlayerNumber = ++AssignedPlayers;
+	}
+}
+
+void ACFRGameMode::SyncStateToGameState()
+{
+	if (!CFRGameState) { return; }
+
+	CFRGameState->Board     = CurrentBoard;
+	CFRGameState->bGameOver = bGameOver;
 }
 
 void ACFRGameMode::SwitchGameMode()
@@ -30,32 +75,49 @@ void ACFRGameMode::SwitchGameMode()
 	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ACFRPiece::StaticClass(), Pieces);
 	for (AActor* Piece : Pieces) { Piece->Destroy(); }
 
-	// Toggle rule set and reset board.
-	if (Rules->GetGameMode() == ECFRGameMode::Mode2D)
+	// Cycle rule set: Mode2D -> Mode2DClassic -> Mode3D -> Mode2D.
+	switch (Rules->GetGameMode())
 	{
+	case ECFRGameMode::Mode2D:
+		Rules = NewObject<UCFRGameRules2DClassic>(this);
+		break;
+	case ECFRGameMode::Mode2DClassic:
 		Rules = NewObject<UCFRGameRules3D>(this);
-	}
-	else
-	{
+		break;
+	default: // Mode3D
 		Rules = NewObject<UCFRGameRules2D>(this);
+		break;
 	}
 
 	CurrentBoard   = Rules->CreateInitialBoard();
 	HoveredColumn  = -1;
+	HoveredRow     = 0;
 	HoveredDepth   = 0;
+	bGameOver      = false;
+
+	// Switching mode discards the unfinished game and starts a fresh record.
+	if (Recorder) { Recorder->StartGame(CurrentBoard); }
+
+	SyncStateToGameState();
+	OnGameStarted(Rules->GetGameMode());
 }
 
 bool ACFRGameMode::TryDrop(int32 X, int32 Z)
 {
-	if (!Rules) { return false; }
+	if (!Rules || bGameOver || !HasAuthority()) { return false; }
 
-	// Capture the active player before ApplyDrop advances the turn.
+	// Capture the active player and pre-move board before ApplyDrop advances the turn.
 	const int32 ActivePlayer = CurrentBoard.CurrentPlayer;
+	const FCFRBoardState BoardBefore = CurrentBoard;
 
 	FCFRBoardState NextBoard;
 	if (!Rules->ApplyDrop(CurrentBoard, X, Z, NextBoard)) { return false; }
 
 	CurrentBoard = NextBoard;
+	SyncStateToGameState();
+
+	// Record the move (human play -> one-hot policy). LastMoveY is the landing row.
+	if (Recorder) { Recorder->RecordMove(BoardBefore, X, CurrentBoard.LastMoveY, Z); }
 
 	// Spawn the piece above the column and let it fall to the target cell.
 	TSubclassOf<ACFRPiece> PieceClass = (ActivePlayer == 1) ? PieceActorClassP1 : PieceActorClassP2;
@@ -82,6 +144,10 @@ bool ACFRGameMode::TryDrop(int32 X, int32 Z)
 	const ECFRGameResult Result = Rules->CheckResult(CurrentBoard);
 	if (Result != ECFRGameResult::Ongoing)
 	{
+		bGameOver = true;
+		SyncStateToGameState();
+		if (Recorder) { Recorder->EndGame(Result); }
+		ShowDebugResult(Result);
 		OnGameEnded(Result);
 	}
 
@@ -90,14 +156,19 @@ bool ACFRGameMode::TryDrop(int32 X, int32 Z)
 
 bool ACFRGameMode::TryPlace(int32 X, int32 Y, int32 Z)
 {
-	if (!Rules) { return false; }
+	if (!Rules || bGameOver || !HasAuthority()) { return false; }
 
 	const int32 ActivePlayer = CurrentBoard.CurrentPlayer;
+	const FCFRBoardState BoardBefore = CurrentBoard;
 
 	FCFRBoardState NextBoard;
 	if (!Rules->ApplyPlace(CurrentBoard, X, Y, Z, NextBoard)) { return false; }
 
 	CurrentBoard = NextBoard;
+	SyncStateToGameState();
+
+	// Record the move (human play -> one-hot policy).
+	if (Recorder) { Recorder->RecordMove(BoardBefore, X, Y, Z); }
 
 	// Spawn the piece above the target cell and let it fall straight down.
 	TSubclassOf<ACFRPiece> PieceClass = (ActivePlayer == 1) ? PieceActorClassP1 : PieceActorClassP2;
@@ -120,6 +191,10 @@ bool ACFRGameMode::TryPlace(int32 X, int32 Y, int32 Z)
 	const ECFRGameResult Result = Rules->CheckResult(CurrentBoard);
 	if (Result != ECFRGameResult::Ongoing)
 	{
+		bGameOver = true;
+		SyncStateToGameState();
+		if (Recorder) { Recorder->EndGame(Result); }
+		ShowDebugResult(Result);
 		OnGameEnded(Result);
 	}
 
@@ -160,8 +235,10 @@ void ACFRGameMode::DrawDebugGrid() const
 		// ----------------------------------------------------------------
 		const FVector BoxExtent2D(VisualHalf, VisualHalf, SlabHalf);
 
-		const bool bCellValid = (HoveredColumn >= 0 && HoveredColumn < CurrentBoard.SizeX
-			                  && HoveredRow    >= 0 && HoveredRow    < CurrentBoard.SizeY);
+		const bool bFree       = CurrentBoard.UsesFreePlacement();
+		const bool bColHovered = (HoveredColumn >= 0 && HoveredColumn < CurrentBoard.SizeX);
+		const bool bCellValid  = (bColHovered
+			                   && HoveredRow >= 0 && HoveredRow < CurrentBoard.SizeY);
 
 		for (int32 Y = 0; Y < CurrentBoard.SizeY; ++Y)
 		{
@@ -170,9 +247,20 @@ void ACFRGameMode::DrawDebugGrid() const
 				const FVector Centre = GetCellWorldPosition(X, Y, 0);
 
 				FColor Color = FColor::Cyan;
-				if (X == HoveredColumn && Y == HoveredRow && bCellValid)
+				if (bFree)
 				{
-					const bool bLegal = Rules->IsLegalPlace(CurrentBoard, X, Y, 0);
+					// Free placement: highlight only the single hovered cell (X, Y).
+					if (X == HoveredColumn && Y == HoveredRow && bCellValid)
+					{
+						const bool bLegal = Rules->IsLegalPlace(CurrentBoard, X, Y, 0);
+						Color = bLegal ? FColor::Green : FColor::Red;
+					}
+				}
+				else if (X == HoveredColumn && bColHovered)
+				{
+					// Classic column-drop: highlight the whole hovered column —
+					// green if the column still has room, red if it is full.
+					const bool bLegal = Rules->IsLegalDrop(CurrentBoard, X, 0);
 					Color = bLegal ? FColor::Green : FColor::Red;
 				}
 
@@ -187,7 +275,9 @@ void ACFRGameMode::DrawDebugGrid() const
 	else
 	{
 		// ----------------------------------------------------------------
-		// 3D mode — flat 4 × 4 base grid on the ground (Board Y = 0 only).
+		// 3D mode — flat 4 × 4 base grid on the ground; the hovered column is
+		// highlighted as a full vertical stack so the player can see exactly
+		// which (X, Z) column the piece will drop into.
 		// Z half-extent = CellHeight * 0.5f so the box visually matches the
 		// flat donut mesh proportions.  Adjust CellHeight in the Details
 		// panel to match your actual mesh height.
@@ -195,25 +285,32 @@ void ACFRGameMode::DrawDebugGrid() const
 		const float PieceHalfH  = FMath::Max(1.f, CellHeight * 0.5f);
 		const FVector BoxExtent3D(VisualHalf, VisualHalf, PieceHalfH);
 
+		// Base grid: one cyan box per (X, Z) column with its coordinate label.
 		for (int32 Z = 0; Z < CurrentBoard.SizeZ; ++Z)
 		{
 			for (int32 X = 0; X < CurrentBoard.SizeX; ++X)
 			{
 				const FVector Centre = GetCellWorldPosition(X, 0, Z);
-
-				const bool bIsHovered = (X == HoveredColumn && Z == HoveredDepth);
-				FColor Color = FColor::Cyan;
-				if (bIsHovered)
-				{
-					const bool bLegal = Rules->IsLegalDrop(CurrentBoard, X, Z);
-					Color = bLegal ? FColor::Green : FColor::Red;
-				}
-
-				DrawDebugBox(GetWorld(), Centre, BoxExtent3D, Color, false, -1.f, 0, 1.5f);
+				DrawDebugBox(GetWorld(), Centre, BoxExtent3D, FColor::Cyan, false, -1.f, 0, 1.5f);
 
 				const FString Label = FString::Printf(TEXT("%d,%d"), X, Z);
 				DrawDebugString(GetWorld(), Centre + FVector(0.f, 0.f, PieceHalfH + 5.f),
 					Label, nullptr, FColor::Yellow, 0.f, false, 0.8f);
+			}
+		}
+
+		// Hovered column: highlight the entire vertical stack (all rows) — green
+		// if a drop is still legal, red if the column is full.
+		const bool bColHovered = (HoveredColumn >= 0 && HoveredColumn < CurrentBoard.SizeX
+			                   && HoveredDepth  >= 0 && HoveredDepth  < CurrentBoard.SizeZ);
+		if (bColHovered)
+		{
+			const bool bLegal = Rules->IsLegalDrop(CurrentBoard, HoveredColumn, HoveredDepth);
+			const FColor Color = bLegal ? FColor::Green : FColor::Red;
+			for (int32 Y = 0; Y < CurrentBoard.SizeY; ++Y)
+			{
+				const FVector Centre = GetCellWorldPosition(HoveredColumn, Y, HoveredDepth);
+				DrawDebugBox(GetWorld(), Centre, BoxExtent3D, Color, false, -1.f, 0, 1.5f);
 			}
 		}
 	}
@@ -254,4 +351,23 @@ FVector ACFRGameMode::GetCellWorldPosition(int32 X, int32 Y, int32 Z) const
 			Y * CellHeight   // Board Y → World Z  (vertical stacking, uses CellHeight)
 		);
 	}
+}
+
+void ACFRGameMode::ShowDebugResult(ECFRGameResult Result) const
+{
+	if (!GEngine) { return; }
+
+	FString  Message;
+	FColor   Color = FColor::White;
+
+	switch (Result)
+	{
+	case ECFRGameResult::Player1Wins: Message = TEXT("Player 1 Wins!"); Color = FColor::Yellow; break;
+	case ECFRGameResult::Player2Wins: Message = TEXT("Player 2 Wins!"); Color = FColor::Cyan;   break;
+	case ECFRGameResult::Draw:        Message = TEXT("Draw!");          Color = FColor::White;  break;
+	default:                          return; // Ongoing — nothing to show.
+	}
+
+	// Key -1 appends a fresh line; shown for 5 seconds. Remove once BP_CFRGameMode has result UI.
+	GEngine->AddOnScreenDebugMessage(-1, 5.f, Color, Message);
 }

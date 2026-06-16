@@ -55,16 +55,18 @@ ConnectFourRL/
 │
 ├── Game/ConnectFourRL/
 │   └── Source/ConnectFourRL/          # ALL C++ files live here (flat — no subfolders)
-│       ├── CFRBoardState.h            # USTRUCT — board data and cell index logic
-│       ├── CFRGameRules.h/.cpp        # UINTERFACE — rule contract
+│       ├── CFRBoardState.h            # USTRUCT — board data, index logic, action encoding, legality
+│       ├── CFRGameRules.h/.cpp        # UINTERFACE — rule contract + ECFRGameMode / ECFRGameResult
 │       ├── CFRGameRulesBase.h/.cpp    # Abstract UObject — shared logic
-│       ├── CFRGameRules2D.h/.cpp      # Concrete 2D rule set (4 directions)
-│       ├── CFRGameRules3D.h/.cpp      # Concrete 3D rule set (13 directions)
-│       ├── CFRGameMode.h/.cpp         # AGameModeBase — session controller
-│       ├── CFRPlayerController.h/.cpp # APlayerController — mouse input via ray trace
-│       ├── CFRPiece.h/.cpp            # AActor — falling piece with animation
-│       ├── CFRGameState.h/.cpp        # AGameStateBase — shell for networking
-│       ├── CFRGameRecorder.h/.cpp     # UObject — shell for AI data recording
+│       ├── CFRGameRules2D.h/.cpp      # Concrete 2D rule set — free placement (4 directions)
+│       ├── CFRGameRules2DClassic.h/.cpp # Concrete 2D rule set — gravity drop (4 directions)
+│       ├── CFRGameRules3D.h/.cpp      # Concrete 3D rule set — gravity drop (13 directions)
+│       ├── CFRGameMode.h/.cpp         # AGameModeBase — server-authoritative session controller
+│       ├── CFRPlayerController.h/.cpp # APlayerController — ray-trace input + Server RPCs
+│       ├── CFRPiece.h/.cpp            # AActor — replicated falling piece
+│       ├── CFRGameState.h/.cpp        # AGameStateBase — replicated board + visual params (networking)
+│       ├── CFRGameRecorder.h/.cpp     # UObject — JSON game recorder for AI training
+│       ├── CFRHoverIndicator.h/.cpp   # AActor — local per-client hover highlight
 │       └── CFRColumnActor.h/.cpp      # AActor — superseded by PlayerController ray trace
 │
 └── AI/                                # Python pipeline (not yet implemented)
@@ -127,7 +129,15 @@ Key methods:
   SetCell(X, Y, Z, Value)              Safe write — no-op if out of bounds
   IsInBounds(X, Y, Z)                  Bounds check for all three axes
   GetDropRow(X, Z)                     Gravity — lowest empty Y in column, or -1 if full
+  UsesFreePlacement()                  True only for Mode2D (mechanic discriminator)
+  GetActionSpaceSize()                 Policy size: SizeX*SizeY (free) or SizeX*SizeZ (drop)
+  EncodeAction(X, Y, Z)                Flat action index: X+Y*SizeX (free) or X+Z*SizeX (drop)
+  IsLegalDrop(X, Z)                    Board-level legality (no rule set) — usable on clients
+  IsLegalPlace(X, Y, Z)                Board-level legality (no rule set) — usable on clients
 ```
+
+> `ECFRGameMode` has three values: `Mode2D`, `Mode2DClassic`, `Mode3D`. Encoding/legality methods are
+> shared with the Python pipeline — keep both sides identical (guarded by the parity test).
 
 Cell index formula:
 ```
@@ -276,15 +286,19 @@ Key UPROPERTY fields:
 
 ```
 Key methods:
-  BeginPlay()                Creates Rules (2D by default) + initial board
-  TryDrop(X, Z)              3D: gravity drop into column (X,Z); spawns ACFRPiece
-  TryPlace(X, Y, Z)          2D: direct placement at cell (X,Y,0); spawns ACFRPiece
-  SwitchGameMode()           Destroys all pieces, toggles 2D↔3D, resets board
+  BeginPlay()                Creates Rules (Mode2D default) + board; inits GameState + Recorder
+  TryDrop(X, Z)              Gravity drop (Classic/3D); records move, syncs GameState, spawns piece
+  TryPlace(X, Y, Z)          Free placement (Mode2D); records move, syncs GameState, spawns piece
+  SwitchGameMode()           Destroys pieces, cycles Mode2D→Mode2DClassic→Mode3D, resets board
+  PostLogin(PC)              Assigns PlayerNumber (1,2,...) for turn ownership
+  SyncStateToGameState()     Mirrors CurrentBoard + bGameOver into the replicated GameState
   GetCellWorldPosition(X,Y,Z) Board coords → world space (mode-aware, see below)
-  SetHoveredCell(Col,Row,Depth) Called every frame by PlayerController
-  DrawDebugGrid()            Internal — draws cell overlay when bDrawDebugGrid = true
+  ShowDebugResult(Result)    Temp on-screen win/draw message (host-only; remove when BP UI exists)
+
+Server-authoritative guards: TryDrop/TryPlace early-out on !HasAuthority() or bGameOver.
 
 Blueprint events (implement in BP_CFRGameMode):
+  OnGameStarted(Mode)        Reset UI for a new game / mode switch
   OnGameEnded(Result)        Show win/draw UI
 ```
 
@@ -303,29 +317,34 @@ Setup:
   bEnableClickEvents = true
 ```
 
+Networked: reads the replicated `ACFRGameState` (not the GameMode, which is server-only) and sends
+input via Server RPCs. Spawns a local `ACFRHoverIndicator` for the owning player.
+
 ```
-Per-frame Tick:
-  1. TraceToBoard()        — ray-plane intersection → hovered cell
-  2. Left click detected   → OnClickBoard()
-  3. Space bar detected    → GameMode->SwitchGameMode()
+Per-frame Tick (local controller only — guarded by IsLocalController()):
+  1. TraceToBoard()        — ray-plane intersection (reads GameState) → hovered cell
+  2. UpdateHoverIndicator()— positions/colours the local hover highlight
+  3. Left click detected   → OnClickBoard()  → Server RPC
+  4. Space bar detected    → Server_SwitchGameMode()
 ```
 
-**TraceToBoard — plane selection:**
+**TraceToBoard — extracts (from GameState->Board):**
 
-| Mode | Intersection Plane | Extracts |
-|------|-------------------|---------|
-| 2D | Z = BoardOrigin.Z (flat ground) | Col (X), Row (Y) |
-| 3D | Z = BoardOrigin.Z (flat ground) | Col (X), Depth (Y→BoardZ) |
+| Mechanic | Extracts |
+|----------|----------|
+| Mode2D (free) | Col (X), Row (Y) |
+| Mode2DClassic | Col (X); Row = gravity landing preview |
+| Mode3D | Col (X), Depth (Y→BoardZ) |
 
-Both modes intersect the horizontal ground plane because both boards have
-their bottom face at World Z = BoardOrigin.Z.
+All modes intersect the horizontal ground plane (`Z = BoardOrigin.Z`).
 
-**OnClickBoard:**
+**OnClickBoard → Server RPC** (server validates turn via `PlayerNumber`):
 
-| Mode | Action |
-|------|--------|
-| 2D | `GameMode->TryPlace(HoveredColumn, HoveredRow, 0)` |
-| 3D | `GameMode->TryDrop(HoveredColumn, HoveredDepth)` |
+| Mechanic | Call |
+|----------|------|
+| Mode2D (free) | `Server_TryPlace(Col, Row, 0)` |
+| Mode2DClassic | `Server_TryDrop(Col, 0)` |
+| Mode3D | `Server_TryDrop(Col, Depth)` |
 
 ---
 
@@ -347,6 +366,11 @@ Methods:
   Tick(DeltaTime)                        VInterpConstantTo toward target; disables when arrived
 ```
 
+**Replication:** `bReplicates = true`, `SetReplicateMovement(false)`. The server spawns the piece and
+calls `StartFall`, which publishes `RepStartLocation` / `RepTargetLocation` / `RepFallSpeed`. On
+`OnRep_FallTarget` each client snaps to the start and runs the same interpolation locally — so the
+fall is deterministic per machine and no per-frame position is sent over the wire.
+
 Blueprint hierarchy:
 ```
 ACFRPiece (C++)
@@ -364,8 +388,20 @@ inside each Blueprint child — no C++ changes needed.
 **File:** `CFRGameState.h / .cpp`
 **Type:** `UCLASS` — inherits `AGameStateBase`
 
-Shell class reserved for the networking phase.
-Will hold a replicated `FCFRBoardState` when multiplayer is implemented.
+Replicated shared state. Because `AGameModeBase` exists only on the server, every client-readable
+value lives here.
+
+```
+Replicated fields:
+  FCFRBoardState Board       ReplicatedUsing=OnRep_Board (mirrored from GameMode each move)
+  bool bGameOver             blocks client input once terminal
+  float CellSize, CellHeight world-space tuning, mirrored from GameMode at BeginPlay
+  FVector BoardOrigin
+
+Methods:
+  GetCellWorldPosition(X,Y,Z)  client-side mirror of GameMode's version (keep identical)
+  OnRep_Board()                client hook (stub — pieces render via replicated actors; Phase 2 UI here)
+```
 
 ---
 
@@ -373,8 +409,47 @@ Will hold a replicated `FCFRBoardState` when multiplayer is implemented.
 **File:** `CFRGameRecorder.h / .cpp`
 **Type:** `UCLASS` — inherits `UObject`
 
-Shell class reserved for AI data collection.
-Will serialize game records to JSON for Deep Learning training.
+Records every completed game and writes `Saved/TrainingData/<game_id>.json` (MCTS-ready schema —
+see HANDOFF §8). Created and driven by `ACFRGameMode` (server-side).
+
+```
+StartGame(InitialBoard)   new game id, capture mode/dims/action_space, reset moves
+RecordMove(BoardBefore, X, Y, Z, VisitCounts=[])
+                          append a move; empty VisitCounts → one-hot policy (human play)
+EndGame(FinalResult)      back-fill value (+1/-1/0 per mover), write JSON file
+```
+
+Per-move record holds: state before, flat `action` (`Board.EncodeAction`), `action_xyz`, `policy`
+(visit counts over the action space), and `value`.
+
+---
+
+### ACFRHoverIndicator
+**File:** `CFRHoverIndicator.h / .cpp`
+**Type:** `UCLASS` — inherits `AActor`
+
+Local, per-client hover highlight (not replicated — each player drives their own from their own cursor).
+`ACFRPlayerController` spawns one for the local player and calls `Update()` each frame.
+
+```
+Update(bShow, bLegal, Center, WorldSize)
+  positions a single mesh, scales it to WorldSize via the mesh's own bounds,
+  and swaps between MaterialLegal (green) / MaterialIllegal (red).
+```
+
+Highlight shape: single cell (Mode2D), whole column along World Y (Mode2DClassic),
+whole vertical column along World Z (Mode3D). Assign mesh + materials in `BP_CFRHoverIndicator`,
+then set `BP_CFRPlayerController.HoverIndicatorClass`.
+
+---
+
+### UCFRGameRules2DClassic
+**File:** `CFRGameRules2DClassic.h / .cpp`
+**Type:** `UCLASS` — inherits `UCFRGameRules2D`
+
+Standard Connect Four: flat 7×6 board, gravity column-drop, 4-direction win. Reuses 2D board
+sizing and `HasPlayerWon`; only overrides `GetGameMode()` to return `Mode2DClassic`. The drop
+mechanic comes from the input layer calling `TryDrop` (chosen via `Board.UsesFreePlacement()`).
 
 ---
 
@@ -435,11 +510,12 @@ and falls straight down to `World Z = Y * CellHeight`.
 ## Rules System Design
 
 ```
-ICFRGameRules              (interface — pure contract)
+ICFRGameRules                  (interface — pure contract)
         │
-UCFRGameRulesBase          (abstract — shared logic)
-        ├── UCFRGameRules2D    (4 directions, free placement)
-        └── UCFRGameRules3D    (13 directions, gravity drop)
+UCFRGameRulesBase              (abstract — shared logic)
+        ├── UCFRGameRules2D            (4 directions, free placement)
+        │     └── UCFRGameRules2DClassic  (inherits 2D board + win; gravity drop)
+        └── UCFRGameRules3D            (13 directions, gravity drop)
 ```
 
 **Why interface + abstract base, not just a base class?**
@@ -447,16 +523,22 @@ UCFRGameRulesBase          (abstract — shared logic)
 - Any system holds `UCFRGameRulesBase*` — never a concrete type
 - Runtime mode switching = swap the pointer, nothing else changes
 - `UCFRGameRulesBase` removes all code duplication between modes
-- Adding a new variant requires only one new subclass
+- Adding a new variant requires only one new subclass (`UCFRGameRules2DClassic` only overrides `GetGameMode()`)
 
-**2D vs 3D placement mechanics:**
+**Two orthogonal axes define a mode** (see `ECFRGameMode`): *geometry* (flat vs cube) and *mechanic*
+(free placement vs gravity drop).
 
-| | 2D | 3D |
-|---|---|---|
-| Player input | Click any empty (X, Y) cell | Click (X, Z) column base |
-| Gravity | None — piece placed at exact (X, Y, 0) | Piece falls to lowest empty Y in (X, Z) |
-| Legal check | `IsLegalPlace(X, Y, Z)` — cell empty? | `IsLegalDrop(X, Z)` — column not full? |
-| Apply method | `ApplyPlace(X, Y, Z, OutBoard)` | `ApplyDrop(X, Z, OutBoard)` |
+| | Mode2D (free) | Mode2DClassic | Mode3D |
+|---|---|---|---|
+| Geometry | flat 7×6 | flat 7×6 | cube 4×4×4 |
+| Player input | click any empty (X, Y) | click column (X) | click (X, Z) column |
+| Gravity | none — exact (X, Y, 0) | lowest empty Y in X | lowest empty Y in (X, Z) |
+| Legal check | `IsLegalPlace(X, Y, Z)` | `IsLegalDrop(X, 0)` | `IsLegalDrop(X, Z)` |
+| Apply method | `ApplyPlace(X, Y, Z)` | `ApplyDrop(X, 0)` | `ApplyDrop(X, Z)` |
+| Action space | 42 (`X+Y*7`) | 7 (`X`) | 16 (`X+Z*4`) |
+
+Geometry is discriminated by `Board.SizeZ`; mechanic by `Board.UsesFreePlacement()` (true only for `Mode2D`).
+`SwitchGameMode()` cycles `Mode2D → Mode2DClassic → Mode3D → Mode2D`.
 
 **Why ApplyDrop / ApplyPlace return a new board instead of mutating?**
 
@@ -551,16 +633,20 @@ ACFRPlayerController::Tick detects Space Bar
          └─ CurrentBoard = Rules->CreateInitialBoard()
 ```
 
-### Networked (planned)
+### Networked (Phase 1 — implemented)
 
 ```
 Client: PlayerController click
-  └─ Server RPC: TryDrop_Server(X, Z) or TryPlace_Server(X, Y, Z)
-         └─ ACFRGameMode (server only)
-                └─ ACFRGameState::Board updated + marked dirty
-                       └─ Replication → all clients
-                              └─ OnRep_Board() → each client spawns ACFRPiece
+  └─ Server RPC: Server_TryDrop(X, Z) / Server_TryPlace(X, Y, Z)
+         └─ turn check: PlayerNumber == GameState->Board.CurrentPlayer ?
+                └─ ACFRGameMode (server only) applies move on CurrentBoard
+                       ├─ SyncStateToGameState()  → replicated Board updates on all clients
+                       └─ SpawnActor<ACFRPiece>   → replicated actor appears on all clients,
+                                                     each animating the fall locally
 ```
+
+The earlier "spawn pieces in OnRep_Board" plan was replaced by **replicated piece actors** — simpler,
+and the board still replicates for hover/legality/late-join. `OnRep_Board` remains for Phase 2 UI.
 
 ---
 
@@ -649,23 +735,31 @@ All calls use `0.f` (single-frame draw) to prevent string accumulation across mo
 
 ---
 
-## Networking Plan
+## Networking
 
-Classes to implement:
+### Phase 1 — DONE (Listen Server)
 
-| Class | Type | Role |
-|-------|------|------|
-| `ACFRGameState` | `AGameState` | Holds replicated `FCFRBoardState`; replicates board to all clients |
+`AGameModeBase` exists only on the server, so all client-readable state was moved to the replicated
+`ACFRGameState`. The authoritative board still lives on `ACFRGameMode::CurrentBoard`; after every
+change `SyncStateToGameState()` mirrors it into the GameState.
 
-Changes to existing classes:
+| Concern | Implementation |
+|---------|----------------|
+| Board / params to clients | `ACFRGameState` replicates `Board`, `bGameOver`, `CellSize/CellHeight/BoardOrigin` |
+| Pieces to clients | `ACFRPiece` is replicated (server spawns); fall animation runs locally from replicated start/target/speed |
+| Client input | `ACFRPlayerController::Server_TryDrop / Server_TryPlace / Server_SwitchGameMode` (Server RPCs) |
+| Authority | `ACFRGameMode::TryDrop/TryPlace` guard `!HasAuthority()`; input only ticks for `IsLocalController()` |
+| Turn ownership | `PostLogin` assigns `PlayerNumber`; RPCs reject `PlayerNumber != Board.CurrentPlayer` |
+| Client legality | `FCFRBoardState::IsLegalDrop/IsLegalPlace` (board-level, no rule set needed) |
 
-| Class | Change |
-|-------|--------|
-| `ACFRPlayerController` | Replace direct `TryDrop` / `TryPlace` with Server RPCs |
-| `ACFRGameMode` | Add `HasAuthority()` guard to `TryDrop` / `TryPlace` |
-| Blueprint layer | Move piece spawn from game mode to `OnRep_Board` callback on clients |
+Test in PIE: Number of Players = 2, Net Mode = **Play As Listen Server**.
 
-`FCFRBoardState` requires no changes — `TArray` replicates natively in UE5.
+### Remaining
+
+- **Phase 2** — hover/grid and win/draw UI are server-side today (`DrawDebugGrid`, `ShowDebugResult`); move client-side (`ACFRHoverIndicator` already does this; `OnRep_Board` is the hook for UI).
+- **Phase 3** — Dedicated Server target + packaging.
+
+`FCFRBoardState` needs no custom serialization — `TArray<ECFRCell>` replicates natively in UE5.
 
 ---
 

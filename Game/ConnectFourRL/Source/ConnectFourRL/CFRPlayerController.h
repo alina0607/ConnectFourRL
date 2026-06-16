@@ -6,6 +6,8 @@
 #include "GameFramework/PlayerController.h"
 #include "CFRPlayerController.generated.h"
 
+class ACFRHoverIndicator;
+
 /**
  * @brief Player controller for Connect Four.
  *
@@ -28,7 +30,40 @@ public:
 
 	virtual void Tick(float DeltaTime) override;
 
+	/** @brief Player number assigned by the server on login (1 or 2; 0 = unassigned). */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Game")
+	int32 PlayerNumber = 0;
+
+	/** @brief Hover indicator class to spawn for the local player. Set to BP_CFRHoverIndicator. */
+	UPROPERTY(EditDefaultsOnly, Category = "Game")
+	TSubclassOf<ACFRHoverIndicator> HoverIndicatorClass;
+
+protected:
+
+	virtual void BeginPlay() override;
+
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
 private:
+
+	/** @brief Server RPC: requests a gravity column-drop at (X, Z). */
+	UFUNCTION(Server, Reliable)
+	void Server_TryDrop(int32 X, int32 Z);
+
+	/** @brief Server RPC: requests a free placement at cell (X, Y, Z). */
+	UFUNCTION(Server, Reliable)
+	void Server_TryPlace(int32 X, int32 Y, int32 Z);
+
+	/** @brief Server RPC: requests a 2D/3D mode switch (resets the game). */
+	UFUNCTION(Server, Reliable)
+	void Server_SwitchGameMode();
+
+	/** @brief Updates the local hover indicator from the current hovered cell/column. */
+	void UpdateHoverIndicator();
+
+	/** @brief Local hover highlight (spawned for the local player only). */
+	UPROPERTY()
+	TObjectPtr<ACFRHoverIndicator> HoverIndicator;
 
 	/**
 	 * @brief Projects the mouse cursor onto the board plane and updates

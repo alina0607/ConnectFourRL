@@ -112,19 +112,12 @@ bool UCFRGameRulesBase::ApplyDrop(const FCFRBoardState& Board, int32 X, int32 Z,
 
 bool UCFRGameRulesBase::IsLegalDrop(const FCFRBoardState& Board, int32 X, int32 Z) const
 {
-	if (!Board.IsInBounds(X, 0, Z))
-	{
-		return false;
-	}
-
-	// -1 means the column is full.
-	return Board.GetDropRow(X, Z) != -1;
+	return Board.IsLegalDrop(X, Z);
 }
 
 bool UCFRGameRulesBase::IsLegalPlace(const FCFRBoardState& Board, int32 X, int32 Y, int32 Z) const
 {
-	// The target cell must be inside the board and currently empty.
-	return Board.IsInBounds(X, Y, Z) && Board.GetCell(X, Y, Z) == ECFRCell::Empty;
+	return Board.IsLegalPlace(X, Y, Z);
 }
 
 bool UCFRGameRulesBase::ApplyPlace(

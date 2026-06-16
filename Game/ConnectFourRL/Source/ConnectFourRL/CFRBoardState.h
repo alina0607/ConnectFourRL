@@ -19,14 +19,16 @@ enum class ECFRCell : uint8
 /**
  * @brief Represents the current game mode.
  *
- * @note Mode2D uses a 6x7x1 board (classic Connect Four).
- *       Mode3D uses a 4x4x4 board.
+ * @note Mode2D        — 7x6x1 board, free placement (pick any empty cell).
+ *       Mode2DClassic — 7x6x1 board, gravity column-drop (classic Connect Four).
+ *       Mode3D        — 4x4x4 board, gravity column-drop.
  */
 UENUM(BlueprintType)
 enum class ECFRGameMode : uint8
 {
-	Mode2D  UMETA(DisplayName = "2D"),
-	Mode3D  UMETA(DisplayName = "3D")
+	Mode2D        UMETA(DisplayName = "2D"),
+	Mode2DClassic UMETA(DisplayName = "2D Classic"),
+	Mode3D        UMETA(DisplayName = "3D")
 };
 
 /**
@@ -191,5 +193,80 @@ struct CONNECTFOURRL_API FCFRBoardState
 			}
 		}
 		return -1; // Column is full
+	}
+
+	/**
+	 * @brief Returns true if the active mode lets the player place a piece in any
+	 *        empty cell (X, Y) directly, bypassing gravity.
+	 *
+	 * Only Mode2D uses free placement. Mode2DClassic and Mode3D both use the
+	 * gravity column-drop mechanic, so the player chooses a column and the row
+	 * is determined by the lowest empty cell.
+	 *
+	 * @return True for Mode2D; false for Mode2DClassic and Mode3D.
+	 */
+	bool UsesFreePlacement() const
+	{
+		return GameMode == ECFRGameMode::Mode2D;
+	}
+
+	/**
+	 * @brief Returns the number of distinct actions for this mode (policy head size).
+	 *
+	 * Free placement (Mode2D): every cell is an action      -> SizeX * SizeY.
+	 * Column drop (Classic / 3D): every (X, Z) column is one -> SizeX * SizeZ
+	 *   (Classic has SizeZ == 1, so this collapses to SizeX).
+	 *
+	 * @return The flat action-space size used to index the policy vector.
+	 */
+	int32 GetActionSpaceSize() const
+	{
+		return UsesFreePlacement() ? (SizeX * SizeY) : (SizeX * SizeZ);
+	}
+
+	/**
+	 * @brief Encodes a move into a flat action index matching GetActionSpaceSize().
+	 *
+	 * Free placement encodes the chosen cell (X, Y); column drop encodes the
+	 * chosen column (X, Z) and ignores Y (gravity determines the row).
+	 * The encoding is shared with the Python training pipeline — keep both sides
+	 * identical.
+	 *
+	 * @param X  Column index.
+	 * @param Y  Row index (used only in free placement).
+	 * @param Z  Depth index (used only in column drop; always 0 for 2D modes).
+	 * @return   The flat action index.
+	 */
+	int32 EncodeAction(int32 X, int32 Y, int32 Z) const
+	{
+		return UsesFreePlacement() ? (X + Y * SizeX) : (X + Z * SizeX);
+	}
+
+	/**
+	 * @brief Returns true if a gravity drop at column (X, Z) is legal.
+	 *
+	 * Board-level query (no rule set required) so clients can evaluate legality
+	 * from the replicated board alone — used for hover feedback.
+	 *
+	 * @param X  Column index.
+	 * @param Z  Depth index (0 in 2D modes).
+	 */
+	bool IsLegalDrop(int32 X, int32 Z) const
+	{
+		return IsInBounds(X, 0, Z) && GetDropRow(X, Z) != -1;
+	}
+
+	/**
+	 * @brief Returns true if placing at cell (X, Y, Z) is legal (in bounds & empty).
+	 *
+	 * Board-level query for 2D free placement; usable on clients for hover feedback.
+	 *
+	 * @param X  Column index.
+	 * @param Y  Row index.
+	 * @param Z  Depth index (0 in 2D modes).
+	 */
+	bool IsLegalPlace(int32 X, int32 Y, int32 Z) const
+	{
+		return IsInBounds(X, Y, Z) && GetCell(X, Y, Z) == ECFRCell::Empty;
 	}
 };
