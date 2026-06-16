@@ -27,12 +27,37 @@ public:
 	/**
 	 * @brief Begins the fall animation toward the given world position.
 	 *
+	 * Called on the server after spawn. The target and speed replicate to
+	 * clients, which then run the same interpolation locally — no per-frame
+	 * position replication is needed.
+	 *
 	 * @param InTargetLocation  The board cell centre the piece should land on.
 	 * @param InFallSpeed       Movement speed in Unreal units per second.
 	 */
 	void StartFall(const FVector& InTargetLocation, float InFallSpeed);
 
+protected:
+
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
 private:
+
+	/** @brief Replicated spawn (top) position; clients snap here before starting the fall. */
+	UPROPERTY(Replicated)
+	FVector RepStartLocation = FVector::ZeroVector;
+
+	/** @brief Replicated landing position; clients begin their local fall when it arrives. */
+	UPROPERTY(ReplicatedUsing = OnRep_FallTarget)
+	FVector RepTargetLocation = FVector::ZeroVector;
+
+	/** @brief Replicated fall speed so clients animate at the same rate as the server. */
+	UPROPERTY(Replicated)
+	float RepFallSpeed = 0.f;
+
+	/** @brief Client callback: starts the local fall toward the replicated target. */
+	UFUNCTION()
+	void OnRep_FallTarget();
+
 
 	/** @brief Invisible root — anchors the Actor at the exact spawn position. */
 	UPROPERTY(VisibleAnywhere, Category = "Piece")

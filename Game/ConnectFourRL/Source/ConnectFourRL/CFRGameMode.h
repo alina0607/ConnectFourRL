@@ -10,6 +10,8 @@
 
 class UCFRGameRulesBase;
 class ACFRPiece;
+class UCFRGameRecorder;
+class ACFRGameState;
 
 /**
  * @brief Game mode that owns the rule set and live board state for a Connect Four session.
@@ -41,6 +43,18 @@ public:
 	/** @brief The live board state updated after every accepted move. */
 	UPROPERTY(BlueprintReadOnly, Category = "Game")
 	FCFRBoardState CurrentBoard;
+
+	/** @brief When true, records each completed game as JSON training data. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recording")
+	bool bRecordGames = true;
+
+	/** @brief Records moves and exports finished games. Created at BeginPlay when bRecordGames is set. */
+	UPROPERTY()
+	TObjectPtr<UCFRGameRecorder> Recorder;
+
+	/** @brief True once the game reaches a terminal state; blocks further input until the board is reset. */
+	UPROPERTY(BlueprintReadOnly, Category = "Game")
+	bool bGameOver = false;
 
 	// ------------------------------------------------------------------
 	// Visual configuration
@@ -191,6 +205,15 @@ public:
 	// ------------------------------------------------------------------
 
 	/**
+	 * @brief Fired when a new game session begins or the mode is switched.
+	 * Blueprint should reset the UI and prepare for the new session.
+	 *
+	 * @param Mode  The active game mode (Mode2D or Mode3D).
+	 */
+	UFUNCTION(BlueprintImplementableEvent, Category = "Game")
+	void OnGameStarted(ECFRGameMode Mode);
+
+	/**
 	 * @brief Fired when the game reaches a terminal state.
 	 * Blueprint should display the result (win / draw) UI.
 	 *
@@ -204,8 +227,24 @@ protected:
 	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaSeconds) override;
 
+	/** @brief Assigns a player number (1, 2, ...) to each joining controller. */
+	virtual void PostLogin(APlayerController* NewPlayer) override;
+
 private:
+
+	/** @brief Cached replicated game state. Clients read it; the server mirrors into it. */
+	UPROPERTY()
+	TObjectPtr<ACFRGameState> CFRGameState;
+
+	/** @brief Number of players assigned so far (used to hand out player numbers). */
+	int32 AssignedPlayers = 0;
+
+	/** @brief Pushes the authoritative board and game-over flag into the replicated GameState. */
+	void SyncStateToGameState();
 
 	/** @brief Draws a box at every cell centre to visualise grid layout during PIE. */
 	void DrawDebugGrid() const;
+
+	/** @brief Shows the game result as an on-screen debug message. Temporary aid until BP_CFRGameMode implements result UI. */
+	void ShowDebugResult(ECFRGameResult Result) const;
 };
